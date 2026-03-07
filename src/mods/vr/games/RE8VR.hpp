@@ -42,6 +42,11 @@ public:
     void fix_player_shadow();
     void slerp_gui(const glm::quat& new_gui_quat);
 
+    /** Physical VR recoil: add kick when weapon fires (called from shoot hook). */
+    void add_recoil_kick();
+    /** Advance spring-damper + attack phase by dt. Call each frame before hand IK. */
+    void update_recoil_state(float dt);
+
     ::REManagedObject* get_localplayer() const;
     ::REManagedObject* get_weapon_object(::REGameObject* player) const;
 
@@ -54,21 +59,48 @@ private:
 
     static HookManager::PreHookResult pre_shadow_late_update(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
     static void post_shadow_late_update(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr);
+    static HookManager::PreHookResult pre_weapon_shoot(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
 
-private:
     const ModToggle::Ptr m_hide_upper_body{ ModToggle::create(generate_name("HideUpperBody"), false) };
     const ModToggle::Ptr m_hide_lower_body{ ModToggle::create(generate_name("HideLowerBody"), false) };
     const ModToggle::Ptr m_hide_arms{ ModToggle::create(generate_name("HideArms"), false) };
     const ModToggle::Ptr m_hide_upper_body_cutscenes{ ModToggle::create(generate_name("AutoHideUpperBodyCutscenes"), true) };
     const ModToggle::Ptr m_hide_lower_body_cutscenes{ ModToggle::create(generate_name("AutoHideLowerBodyCutscenes"), true) };
+    const ModToggle::Ptr m_recoil_enabled{ ModToggle::create(generate_name("VRRecoil"), true) };
 
     ValueList m_options {
         *m_hide_upper_body,
         *m_hide_lower_body,
         *m_hide_arms,
         *m_hide_upper_body_cutscenes,
-        *m_hide_lower_body_cutscenes
+        *m_hide_lower_body_cutscenes,
+        *m_recoil_enabled
     };
+
+    /** Recoil state machine (RE4R-style: sine attack + spring-damper decay). */
+    struct RecoilState {
+        float spring_pos_y{0.0f};
+        float spring_pos_z{0.0f};
+        float spring_vel_y{0.0f};
+        float spring_vel_z{0.0f};
+        float spring_pitch{0.0f};
+        float spring_yaw{0.0f};
+        float spring_vel_pitch{0.0f};
+        float spring_vel_yaw{0.0f};
+        bool attack_active{false};
+        float attack_t{0.0f};
+        float attack_pos_y{0.0f};
+        float attack_pos_z{0.0f};
+        float attack_pitch{0.0f};
+        float attack_yaw{0.0f};
+        std::chrono::steady_clock::time_point last_shot_time{};
+        bool active{false};
+    };
+    RecoilState m_recoil{};
+
+    /** Current recoil offset this frame (weapon-local). Applied to hand IK and camera. */
+    Vector3f m_recoil_position{0.0f, 0.0f, 0.0f};
+    glm::quat m_recoil_rotation{1.0f, 0.0f, 0.0f, 0.0f};
 
     enum PlayerType {
         ETHAN = 0,
