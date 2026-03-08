@@ -1,10 +1,13 @@
 #if defined(RE7) || defined(RE8)
 #include <random>
+#include <cctype>
+#include <glm/gtc/quaternion.hpp>
 #include <sdk/SceneManager.hpp>
 #include <sdk/MurmurHash.hpp>
 #include <sdk/Application.hpp>
 
 #include "HookManager.hpp"
+#include <sdk/REGameObject.hpp>
 
 // Reminder: THIS MUST BE INCLUDED OR THE LOG FILE WILL BALLOON TO GIGANTIC SIZE
 // AND THE GAME MAY CRASH. THIS IS REQUIRED FOR THE sol_lua_push DECLARATION.
@@ -178,53 +181,133 @@ void RE8VR::reset_data() {
     m_right_hand_ik_object = nullptr;
 
     m_recoil = {};
-    m_recoil_position = Vector3f{0.0f, 0.0f, 0.0f};
+    m_recoil_heat = 0.0f;
     m_recoil_rotation = glm::quat{1.0f, 0.0f, 0.0f, 0.0f};
 }
 
 namespace {
-constexpr float RECOIL_POSITION_INTENSITY = 0.005f;
-constexpr float RECOIL_ROTATION_INTENSITY = 0.035f;
-constexpr float RECOIL_HORIZONTAL_SPREAD = 0.015f;
-constexpr float RECOIL_VERTICAL_SPREAD = 0.010f;
+// Pivot-based recoil: rotation only (muzzle flip around hand). No position translation.
+constexpr float RECOIL_PITCH_INTENSITY = 0.078f;   // ~4.5° peak pitch (muzzle up)
+constexpr float RECOIL_YAW_SPREAD = 0.022f;       // random yaw variance (radians)
 constexpr float RECOIL_RANDOMNESS = 0.35f;
 constexpr float RECOIL_STACK_CAP = 2.0f;
-constexpr float RECOIL_SPRING_STIFFNESS = 120.0f;
-constexpr float RECOIL_SPRING_DAMPING = 18.0f;
 constexpr float RECOIL_ATTACK_DURATION = 0.022f;
-constexpr float RECOIL_SUSTAINED_DAMPING = 28.0f;
 constexpr float RECOIL_SUSTAINED_WINDOW = 0.12f;
+constexpr float RECOIL_SUSTAINED_DAMPING = 28.0f;
+constexpr float RECOIL_HEAT_RISE_PER_SHOT = 0.12f;  // automatic heat accumulation
+constexpr float RECOIL_HEAT_DECAY_RATE = 2.5f;      // per second when not firing
+constexpr float RECOIL_HEAT_MAX_MULT = 0.8f;        // impulse *= 1 + heat * this
+
+enum RecoilClass : uint8_t {
+    RECOIL_HANDGUN = 0,
+    RECOIL_SHOTGUN,
+    RECOIL_AUTOMATIC,
+    RECOIL_RIFLE,
+    RECOIL_MAGNUM,
+    RECOIL_LAUNCHER,
+    RECOIL_MELEE,
+};
+
+struct RecoilParams {
+    float impulse_scale;
+    float spring_k;      // stiffness: higher = faster return
+    float spring_c;      // damping: critical ~ 2*sqrt(k)
+    float attack_duration;
+};
+
+constexpr RecoilParams RECOIL_PARAMS[] = {
+    { 1.0f,  120.0f, 18.0f, 0.022f },  // HANDGUN: default
+    { 1.9f,   65.0f, 22.0f, 0.032f },  // SHOTGUN: high impulse, slow recovery
+    { 1.2f,  100.0f, 20.0f, 0.018f },  // AUTOMATIC: heat adds; slightly softer per shot
+    { 1.65f,  95.0f, 19.0f, 0.024f },  // RIFLE
+    { 2.0f,   90.0f, 20.0f, 0.026f },  // MAGNUM
+    { 2.5f,   55.0f, 24.0f, 0.038f },  // LAUNCHER: very high impulse, slow recovery
+    { 0.0f,  120.0f, 18.0f, 0.022f },  // MELEE: no recoil
+};
 }
 
-HookManager::PreHookResult RE8VR::pre_weapon_shoot(std::vector<uintptr_t>&, std::vector<sdk::RETypeDefinition*>&, uintptr_t) {
-    RE8VR::get()->add_recoil_kick();
+/** Returns weapon class for recoil scaling (Handgun, Shotgun, Automatic, etc.). */
+static RecoilClass get_weapon_recoil_class(::REManagedObject* weapon_obj) {
+    if (weapon_obj == nullptr) return RECOIL_HANDGUN;
+    ::REGameObject* owner = sdk::call_object_func_easy<::REGameObject*>(weapon_obj, "get_GameObject");
+    if (owner == nullptr) return RECOIL_HANDGUN;
+    std::string name = utility::re_game_object::get_name(owner);
+    if (name.empty()) return RECOIL_HANDGUN;
+    std::string lower;
+    lower.reserve(name.size());
+    for (unsigned char c : name) lower.push_back((char)std::tolower((unsigned char)c));
+
+    if (lower.find("shotgun") != std::string::npos || lower.find("m1897") != std::string::npos ||
+        lower.find("w870") != std::string::npos || lower.find("striker") != std::string::npos)
+        return RECOIL_SHOTGUN;
+    if (lower.find("magnum") != std::string::npos || lower.find("handcannon") != std::string::npos ||
+        lower.find("killer7") != std::string::npos || lower.find("broken") != std::string::npos ||
+        lower.find("stake") != std::string::npos)
+        return RECOIL_MAGNUM;
+    if (lower.find("rocket") != std::string::npos || lower.find("launcher") != std::string::npos)
+        return RECOIL_LAUNCHER;
+    if (lower.find("rifle") != std::string::npos || lower.find("sniper") != std::string::npos ||
+        lower.find("m1903") != std::string::npos || lower.find("stingray") != std::string::npos)
+        return RECOIL_RIFLE;
+    // Automatic: SMGs, full-auto; use heat accumulation
+    if (lower.find("smg") != std::string::npos || lower.find("tmp") != std::string::npos ||
+        lower.find("cqbr") != std::string::npos || lower.find("le 5") != std::string::npos ||
+        lower.find("chicago") != std::string::npos || lower.find("sweeper") != std::string::npos)
+        return RECOIL_AUTOMATIC;
+    if (lower.find("crossbow") != std::string::npos) return RECOIL_RIFLE;
+    if (lower.find("knife") != std::string::npos || lower.find("melee") != std::string::npos ||
+        lower.find("grenade") != std::string::npos)
+        return RECOIL_MELEE;
+    return RECOIL_HANDGUN;
+}
+
+HookManager::PreHookResult RE8VR::pre_weapon_shoot(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>&, uintptr_t) {
+    ::REManagedObject* weapon = (args.size() > 1) ? (::REManagedObject*)args[1] : nullptr;
+    RE8VR::get()->add_recoil_kick(weapon);
     return HookManager::PreHookResult::CALL_ORIGINAL;
 }
 
-void RE8VR::add_recoil_kick() {
+void RE8VR::add_recoil_kick(::REManagedObject* weapon_obj) {
     if (!m_recoil_enabled->value() || m_player == nullptr) return;
     auto& vr = VR::get();
     if (!vr->is_hmd_active() || !vr->is_using_controllers()) return;
+
+    const RecoilClass wclass = get_weapon_recoil_class(weapon_obj);
+    if (wclass == RECOIL_MELEE) return;
+
+    const RecoilParams& params = RECOIL_PARAMS[wclass];
+    if (params.impulse_scale <= 0.0f) return;
 
     static std::mt19937 rng{std::random_device{}()};
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
 
     const float random_factor = 1.0f + (u01(rng) - 0.5f) * RECOIL_RANDOMNESS;
-    const float weapon_mult = 1.0f;
-    const float total_mult = std::pow(weapon_mult, 0.35f) * random_factor;
+    float total_mult = params.impulse_scale * random_factor;
 
-    const float pos_peak = RECOIL_POSITION_INTENSITY * total_mult;
-    m_recoil.attack_pos_y += pos_peak * 0.6f;
-    m_recoil.attack_pos_z += -pos_peak;
-    m_recoil.attack_pitch += RECOIL_ROTATION_INTENSITY * total_mult + (u01(rng) - 0.5f) * RECOIL_VERTICAL_SPREAD * total_mult;
-    m_recoil.attack_yaw += (u01(rng) - 0.5f) * 2.0f * RECOIL_HORIZONTAL_SPREAD * total_mult;
+    // Automatics: accumulative heat — intensity rises the longer trigger is held
+    if (wclass == RECOIL_AUTOMATIC) {
+        const auto now = std::chrono::steady_clock::now();
+        const float since_last = std::chrono::duration<float>(now - m_recoil_last_fire_time).count();
+        if (since_last < RECOIL_SUSTAINED_WINDOW)
+            m_recoil_heat = std::min(1.0f, m_recoil_heat + RECOIL_HEAT_RISE_PER_SHOT);
+        else
+            m_recoil_heat = std::min(1.0f, m_recoil_heat + 0.04f); // small rise per shot when starting burst
+        m_recoil_last_fire_time = now;
+        total_mult *= (1.0f + m_recoil_heat * RECOIL_HEAT_MAX_MULT);
+    }
+
+    m_recoil.weapon_class = static_cast<uint8_t>(wclass);
+
+    // Pivot-based: pitch (muzzle up) + slight random yaw only; no position
+    const float pitch_peak = RECOIL_PITCH_INTENSITY * total_mult;
+    const float yaw_peak = (u01(rng) - 0.5f) * 2.0f * RECOIL_YAW_SPREAD * total_mult;
+
+    m_recoil.attack_pitch += pitch_peak;
+    m_recoil.attack_yaw += yaw_peak;
 
     if (RECOIL_STACK_CAP > 0.0f) {
-        const float cap_pos = RECOIL_POSITION_INTENSITY * RECOIL_STACK_CAP;
-        const float cap_rot = RECOIL_ROTATION_INTENSITY * RECOIL_STACK_CAP;
-        const float cap_yaw = RECOIL_HORIZONTAL_SPREAD * RECOIL_STACK_CAP;
-        m_recoil.attack_pos_y = std::min(m_recoil.attack_pos_y, cap_pos * 0.6f);
-        m_recoil.attack_pos_z = std::max(m_recoil.attack_pos_z, -cap_pos);
+        const float cap_rot = RECOIL_PITCH_INTENSITY * params.impulse_scale * RECOIL_STACK_CAP;
+        const float cap_yaw = RECOIL_YAW_SPREAD * RECOIL_STACK_CAP;
         m_recoil.attack_pitch = std::min(m_recoil.attack_pitch, cap_rot);
         m_recoil.attack_yaw = std::clamp(m_recoil.attack_yaw, -cap_yaw, cap_yaw);
     }
@@ -237,67 +320,73 @@ void RE8VR::add_recoil_kick() {
 
 void RE8VR::update_recoil_state(float dt) {
     if (!m_recoil_enabled->value() || (!m_recoil.active && !m_recoil.attack_active)) {
-        m_recoil_position = Vector3f{0.0f, 0.0f, 0.0f};
         m_recoil_rotation = glm::quat{1.0f, 0.0f, 0.0f, 0.0f};
+        // Decay automatic heat when not firing
+        const float since = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_recoil_last_fire_time).count();
+        if (since > RECOIL_SUSTAINED_WINDOW)
+            m_recoil_heat = std::max(0.0f, m_recoil_heat - RECOIL_HEAT_DECAY_RATE * dt);
         return;
     }
     dt = std::clamp(dt, 0.001f, 0.1f);
 
+    const RecoilParams& params = RECOIL_PARAMS[std::min(m_recoil.weapon_class, (uint8_t)RECOIL_MELEE)];
+    const float T = std::max(params.attack_duration, 0.001f);
+
     if (m_recoil.attack_active && dt > 0.0f) {
-        const float T = std::max(RECOIL_ATTACK_DURATION, 0.001f);
         m_recoil.attack_t += dt;
         if (m_recoil.attack_t >= T) {
-            m_recoil.spring_pos_y = m_recoil.attack_pos_y;
-            m_recoil.spring_pos_z = m_recoil.attack_pos_z;
             m_recoil.spring_pitch = m_recoil.attack_pitch;
             m_recoil.spring_yaw = m_recoil.attack_yaw;
-            m_recoil.spring_vel_y = m_recoil.spring_vel_z = m_recoil.spring_vel_pitch = m_recoil.spring_vel_yaw = 0.0f;
-            m_recoil.attack_pos_y = m_recoil.attack_pos_z = m_recoil.attack_pitch = m_recoil.attack_yaw = 0.0f;
+            m_recoil.spring_vel_pitch = m_recoil.spring_vel_yaw = 0.0f;
+            m_recoil.attack_pitch = m_recoil.attack_yaw = 0.0f;
             m_recoil.attack_t = 0.0f;
             m_recoil.attack_active = false;
         } else {
             const float s = std::sin((m_recoil.attack_t / T) * (glm::pi<float>() * 0.5f));
-            m_recoil.spring_pos_y = m_recoil.attack_pos_y * s;
-            m_recoil.spring_pos_z = m_recoil.attack_pos_z * s;
             m_recoil.spring_pitch = m_recoil.attack_pitch * s;
             m_recoil.spring_yaw = m_recoil.attack_yaw * s;
-            m_recoil.spring_vel_y = m_recoil.spring_vel_z = m_recoil.spring_vel_pitch = m_recoil.spring_vel_yaw = 0.0f;
+            m_recoil.spring_vel_pitch = m_recoil.spring_vel_yaw = 0.0f;
         }
     }
 
     if (!m_recoil.attack_active && dt > 0.0f) {
-        float c = RECOIL_SPRING_DAMPING;
+        float c = params.spring_c;
         const float since_last = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_recoil.last_shot_time).count();
         if (since_last < RECOIL_SUSTAINED_WINDOW)
             c += (RECOIL_SUSTAINED_DAMPING - c) * (1.0f - since_last / RECOIL_SUSTAINED_WINDOW);
 
-        const float k = RECOIL_SPRING_STIFFNESS;
+        const float k = params.spring_k;
         const int steps = std::max(1, (int)(dt / 0.008f));
         const float sub = dt / (float)steps;
         for (int i = 0; i < steps; ++i) {
-            m_recoil.spring_vel_y += (-k * m_recoil.spring_pos_y - c * m_recoil.spring_vel_y) * sub;
-            m_recoil.spring_pos_y += m_recoil.spring_vel_y * sub;
-            m_recoil.spring_vel_z += (-k * m_recoil.spring_pos_z - c * m_recoil.spring_vel_z) * sub;
-            m_recoil.spring_pos_z += m_recoil.spring_vel_z * sub;
             m_recoil.spring_vel_pitch += (-k * m_recoil.spring_pitch - c * m_recoil.spring_vel_pitch) * sub;
             m_recoil.spring_pitch += m_recoil.spring_vel_pitch * sub;
             m_recoil.spring_vel_yaw += (-k * m_recoil.spring_yaw - c * m_recoil.spring_vel_yaw) * sub;
             m_recoil.spring_yaw += m_recoil.spring_vel_yaw * sub;
         }
-        const float pos_mag = std::abs(m_recoil.spring_pos_y) + std::abs(m_recoil.spring_pos_z);
         const float rot_mag = std::abs(m_recoil.spring_pitch) + std::abs(m_recoil.spring_yaw);
-        const float vel_mag = std::abs(m_recoil.spring_vel_y) + std::abs(m_recoil.spring_vel_z)
-            + std::abs(m_recoil.spring_vel_pitch) + std::abs(m_recoil.spring_vel_yaw);
-        if (pos_mag < 0.00005f && rot_mag < 0.0002f && vel_mag < 0.001f) {
-            m_recoil.spring_pos_y = m_recoil.spring_pos_z = m_recoil.spring_pitch = m_recoil.spring_yaw = 0.0f;
-            m_recoil.spring_vel_y = m_recoil.spring_vel_z = m_recoil.spring_vel_pitch = m_recoil.spring_vel_yaw = 0.0f;
+        const float vel_mag = std::abs(m_recoil.spring_vel_pitch) + std::abs(m_recoil.spring_vel_yaw);
+        if (rot_mag < 0.0002f && vel_mag < 0.001f) {
+            m_recoil.spring_pitch = m_recoil.spring_yaw = 0.0f;
+            m_recoil.spring_vel_pitch = m_recoil.spring_vel_yaw = 0.0f;
             m_recoil.active = false;
         }
     }
 
-    m_recoil_position = Vector3f{0.0f, m_recoil.spring_pos_y, m_recoil.spring_pos_z};
+    // Pivot-based: rotation only (muzzle flip). RE4-style: pitch around local X, yaw around local Y.
     const float ph = -m_recoil.spring_pitch * 0.5f, yw = m_recoil.spring_yaw * 0.5f;
-    m_recoil_rotation = glm::normalize(glm::quat{std::cos(ph), std::sin(ph), 0.0f, 0.0f} * glm::quat{std::cos(yw), 0.0f, std::sin(yw), 0.0f});
+    m_recoil_rotation = glm::normalize(
+        glm::quat{std::cos(ph), std::sin(ph), 0.0f, 0.0f} *
+        glm::quat{std::cos(yw), 0.0f, std::sin(yw), 0.0f});
+}
+
+glm::quat RE8VR::calculate_recoil(float dt) {
+    update_recoil_state(dt);
+    return m_recoil_rotation;
+}
+
+Matrix4x4f RE8VR::get_recoil_rotation_matrix() const {
+    return Matrix4x4f{glm::mat4_cast(m_recoil_rotation)};
 }
 
 void RE8VR::set_hand_joints_to_tpose(::REManagedObject* hand_ik) {
@@ -471,7 +560,6 @@ void RE8VR::update_hand_ik() {
 
     if (m_recoil_enabled->value() && (m_recoil.active || m_recoil.attack_active)) {
         rh_rotation = rh_rotation * m_recoil_rotation;
-        rh_pos += Vector4f{rh_rotation * Vector3f{m_recoil_position}, 0.0f};
     }
     rh_pos.w = 1.0f;
 

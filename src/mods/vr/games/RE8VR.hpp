@@ -43,9 +43,17 @@ public:
     void slerp_gui(const glm::quat& new_gui_quat);
 
     /** Physical VR recoil: add kick when weapon fires (called from shoot hook). */
-    void add_recoil_kick();
+    void add_recoil_kick(::REManagedObject* weapon_obj = nullptr);
     /** Advance spring-damper + attack phase by dt. Call each frame before hand IK. */
     void update_recoil_state(float dt);
+
+    /**
+     * Pivot-based recoil: rotation only (muzzle flip around hand). Returns current recoil
+     * as rotation offset. Call update_recoil_state(dt) first, or use this which does both.
+     */
+    glm::quat calculate_recoil(float dt);
+    /** Same as quat; convenience for code that needs a 4x4 transform. */
+    Matrix4x4f get_recoil_rotation_matrix() const;
 
     ::REManagedObject* get_localplayer() const;
     ::REManagedObject* get_weapon_object(::REGameObject* player) const;
@@ -77,29 +85,27 @@ private:
         *m_recoil_enabled
     };
 
-    /** Recoil state machine (RE4R-style: sine attack + spring-damper decay). */
+    /** Recoil state machine (RE4R-style: sine attack + spring-damper decay). Pivot-based: rotation only. */
     struct RecoilState {
-        float spring_pos_y{0.0f};
-        float spring_pos_z{0.0f};
-        float spring_vel_y{0.0f};
-        float spring_vel_z{0.0f};
-        float spring_pitch{0.0f};
-        float spring_yaw{0.0f};
+        float spring_pitch{0.0f};   // pitch: + = muzzle up (radians)
+        float spring_yaw{0.0f};     // yaw: random left/right (radians)
         float spring_vel_pitch{0.0f};
         float spring_vel_yaw{0.0f};
         bool attack_active{false};
         float attack_t{0.0f};
-        float attack_pos_y{0.0f};
-        float attack_pos_z{0.0f};
         float attack_pitch{0.0f};
         float attack_yaw{0.0f};
         std::chrono::steady_clock::time_point last_shot_time{};
         bool active{false};
+        uint8_t weapon_class{0};    // RecoilClass
     };
     RecoilState m_recoil{};
 
-    /** Current recoil offset this frame (weapon-local). Applied to hand IK and camera. */
-    Vector3f m_recoil_position{0.0f, 0.0f, 0.0f};
+    /** Automatic-weapon heat (0..1): increases while firing, decays when not. */
+    float m_recoil_heat{0.0f};
+    std::chrono::steady_clock::time_point m_recoil_last_fire_time{};
+
+    /** Current recoil this frame: pivot-only rotation (no position). */
     glm::quat m_recoil_rotation{1.0f, 0.0f, 0.0f, 0.0f};
 
     enum PlayerType {
