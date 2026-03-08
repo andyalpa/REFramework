@@ -49,19 +49,21 @@ REF_BUILD_SF6_SDK = false
 REF_BUILD_DD2_SDK = false
 REF_BUILD_MHWILDS_SDK = false
 REF_BUILD_FRAMEWORK = { value = true }
+REF_BUILD_RE7_RE8_ONLY = false
 REF_BUILD_DEPENDENCIES = { value = true }
 
 [conditions]
 developer-mode-cond = "DEVELOPER_MODE"
-build-framework = "REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8"
+build-framework = "(REF_BUILD_FRAMEWORK OR REF_BUILD_RE7_RE8_ONLY) AND CMAKE_SIZEOF_VOID_P EQUAL 8"
+build-framework-only = "build-framework AND NOT REF_BUILD_RE7_RE8_ONLY"
 build-re2-sdk = "REF_BUILD_RE2_SDK OR REF_BUILD_FRAMEWORK"
 build-re2tdb66-sdk = "REF_BUILD_RE2_TDB66SDK OR REF_BUILD_FRAMEWORK"
 build-re3-sdk = "REF_BUILD_RE3_SDK OR REF_BUILD_FRAMEWORK"
 build-re3tdb67-sdk = "REF_BUILD_RE3_TDB67SDK OR REF_BUILD_FRAMEWORK"
 build-re4-sdk = "REF_BUILD_RE4_SDK OR REF_BUILD_FRAMEWORK"
-build-re7-sdk = "REF_BUILD_RE7_SDK OR REF_BUILD_FRAMEWORK"
+build-re7-sdk = "REF_BUILD_RE7_SDK OR REF_BUILD_FRAMEWORK OR REF_BUILD_RE7_RE8_ONLY"
 build-re7tdb49-sdk = "REF_BUILD_RE7_TDB49SDK OR REF_BUILD_FRAMEWORK"
-build-re8-sdk = "REF_BUILD_RE8_SDK OR REF_BUILD_FRAMEWORK"
+build-re8-sdk = "REF_BUILD_RE8_SDK OR REF_BUILD_FRAMEWORK OR REF_BUILD_RE7_RE8_ONLY"
 build-dmc5-sdk = "REF_BUILD_DMC5_SDK OR REF_BUILD_FRAMEWORK"
 build-mhrise-sdk = "REF_BUILD_MHRISE_SDK OR REF_BUILD_FRAMEWORK"
 build-sf6-sdk = "REF_BUILD_SF6_SDK OR REF_BUILD_FRAMEWORK"
@@ -282,9 +284,11 @@ condition = "build-re2tdb66-sdk"
 
 [target.RE2]
 type = "game"
+condition = "build-framework-only"
 
 [target.RE2_TDB66]
 type = "game"
+condition = "build-framework-only"
 
 [target.RE3SDK]
 type = "sdk"
@@ -298,12 +302,15 @@ condition = "build-re3tdb67-sdk"
 
 [target.RE3]
 type = "game"
+condition = "build-framework-only"
 
 [target.RE3_TDB67]
 type = "game"
+condition = "build-framework-only"
 
 [target.RE4]
 type = "game"
+condition = "build-framework-only"
 
 [target.RE4SDK]
 type = "sdk"
@@ -325,6 +332,7 @@ type = "game"
 
 [target.RE7_TDB49]
 type = "game"
+condition = "build-framework-only"
 
 [target.RE8SDK]
 type = "sdk"
@@ -341,6 +349,7 @@ condition = "build-dmc5-sdk"
 
 [target.DMC5]
 type = "game"
+condition = "build-framework-only"
 
 [target.MHRISESDK]
 type = "sdk"
@@ -349,6 +358,7 @@ condition = "build-mhrise-sdk"
 
 [target.MHRISE]
 type = "game"
+condition = "build-framework-only"
 
 [target.SF6SDK]
 type = "sdk"
@@ -357,6 +367,7 @@ condition = "build-sf6-sdk"
 
 [target.SF6]
 type = "game"
+condition = "build-framework-only"
 
 [target.DD2SDK]
 type = "sdk"
@@ -365,6 +376,7 @@ condition = "build-dd2-sdk"
 
 [target.DD2]
 type = "game"
+condition = "build-framework-only"
 
 [target.MHWILDSSDK]
 type = "sdk"
@@ -373,6 +385,7 @@ condition = "build-mhwilds-sdk"
 
 [target.MHWILDS]
 type = "game"
+condition = "build-framework-only"
 
 [template.plugin]
 type = "shared"

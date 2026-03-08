@@ -1,6 +1,8 @@
 .vs/
 .vscode/
+.cursor/
 build/
+build-re7re8/
 build64_all/
 build64/
 build64_re2/

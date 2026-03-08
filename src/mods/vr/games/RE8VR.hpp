@@ -42,18 +42,12 @@ public:
     void fix_player_shadow();
     void slerp_gui(const glm::quat& new_gui_quat);
 
-    /** Physical VR recoil: add kick when weapon fires (called from shoot hook). */
-    void add_recoil_kick(::REManagedObject* weapon_obj = nullptr);
-    /** Advance spring-damper + attack phase by dt. Call each frame before hand IK. */
-    void update_recoil_state(float dt);
+    void apply_recoil_kickback();
+    void update_recoil(float dt);
+    Vector3f get_recoil_position_offset_world(const glm::quat& camera_rotation) const;
+    glm::quat get_recoil_rotation_offset_world(const glm::quat& camera_rotation) const;
 
-    /**
-     * Pivot-based recoil: rotation only (muzzle flip around hand). Returns current recoil
-     * as rotation offset. Call update_recoil_state(dt) first, or use this which does both.
-     */
-    glm::quat calculate_recoil(float dt);
-    /** Same as quat; convenience for code that needs a 4x4 transform. */
-    Matrix4x4f get_recoil_rotation_matrix() const;
+    float get_weapon_recoil_multiplier() const;
 
     ::REManagedObject* get_localplayer() const;
     ::REManagedObject* get_weapon_object(::REGameObject* player) const;
@@ -65,16 +59,19 @@ private:
     void update_block_gesture();
     void update_heal_gesture();
 
+    static HookManager::PreHookResult pre_weapon_shoot(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
+    static void post_weapon_shoot(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr);
+
     static HookManager::PreHookResult pre_shadow_late_update(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
     static void post_shadow_late_update(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr);
-    static HookManager::PreHookResult pre_weapon_shoot(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
 
+private:
     const ModToggle::Ptr m_hide_upper_body{ ModToggle::create(generate_name("HideUpperBody"), false) };
     const ModToggle::Ptr m_hide_lower_body{ ModToggle::create(generate_name("HideLowerBody"), false) };
     const ModToggle::Ptr m_hide_arms{ ModToggle::create(generate_name("HideArms"), false) };
     const ModToggle::Ptr m_hide_upper_body_cutscenes{ ModToggle::create(generate_name("AutoHideUpperBodyCutscenes"), true) };
     const ModToggle::Ptr m_hide_lower_body_cutscenes{ ModToggle::create(generate_name("AutoHideLowerBodyCutscenes"), true) };
-    const ModToggle::Ptr m_recoil_enabled{ ModToggle::create(generate_name("VRRecoil"), true) };
+    const ModSlider::Ptr m_recoil_intensity{ ModSlider::create(generate_name("RecoilIntensity"), 0.0f, 2.0f, 1.0f) };
 
     ValueList m_options {
         *m_hide_upper_body,
@@ -82,31 +79,8 @@ private:
         *m_hide_arms,
         *m_hide_upper_body_cutscenes,
         *m_hide_lower_body_cutscenes,
-        *m_recoil_enabled
+        *m_recoil_intensity
     };
-
-    /** Recoil state machine (RE4R-style: sine attack + spring-damper decay). Pivot-based: rotation only. */
-    struct RecoilState {
-        float spring_pitch{0.0f};   // pitch: + = muzzle up (radians)
-        float spring_yaw{0.0f};     // yaw: random left/right (radians)
-        float spring_vel_pitch{0.0f};
-        float spring_vel_yaw{0.0f};
-        bool attack_active{false};
-        float attack_t{0.0f};
-        float attack_pitch{0.0f};
-        float attack_yaw{0.0f};
-        std::chrono::steady_clock::time_point last_shot_time{};
-        bool active{false};
-        uint8_t weapon_class{0};    // RecoilClass
-    };
-    RecoilState m_recoil{};
-
-    /** Automatic-weapon heat (0..1): increases while firing, decays when not. */
-    float m_recoil_heat{0.0f};
-    std::chrono::steady_clock::time_point m_recoil_last_fire_time{};
-
-    /** Current recoil this frame: pivot-only rotation (no position). */
-    glm::quat m_recoil_rotation{1.0f, 0.0f, 0.0f, 0.0f};
 
     enum PlayerType {
         ETHAN = 0,
@@ -168,6 +142,42 @@ private:
 
     Vector3f m_hmd_dir_to_left{};
     Vector3f m_hmd_dir_to_right{};
+
+    struct RecoilState {
+        float spring_pos_y{0.0f};
+        float spring_pos_z{0.0f};
+        float spring_vel_y{0.0f};
+        float spring_vel_z{0.0f};
+        float spring_pitch{0.0f};
+        float spring_vel_pitch{0.0f};
+        float spring_yaw{0.0f};
+        float spring_vel_yaw{0.0f};
+    };
+    RecoilState m_recoil{};
+
+    bool m_recoil_attack_active{false};
+    float m_recoil_attack_t{0.0f};
+    float m_recoil_attack_pos_y{0.0f};
+    float m_recoil_attack_pos_z{0.0f};
+    float m_recoil_attack_pitch{0.0f};
+    float m_recoil_attack_yaw{0.0f};
+    float m_recoil_last_shot_t{0.0f};
+    float m_recoil_last_t{0.0f};
+    bool m_recoil_active{false};
+
+    static constexpr float RECOIL_ATTACK_DURATION = 0.008f;
+    static constexpr float RECOIL_SPRING_STIFFNESS = 160.0f;
+    static constexpr float RECOIL_SPRING_DAMPING = 22.0f;
+    static constexpr float RECOIL_SUSTAINED_DAMPING = 32.0f;
+    static constexpr float RECOIL_SUSTAINED_WINDOW = 0.12f;
+    static constexpr float RECOIL_SUBSTEP_DT = 0.008f;
+    static constexpr float RECOIL_POSITION_INTENSITY = 0.012f;
+    static constexpr float RECOIL_ROTATION_INTENSITY = 0.085f;
+    static constexpr float RECOIL_HORIZONTAL_SPREAD = 0.015f;
+    static constexpr float RECOIL_VERTICAL_SPREAD = 0.010f;
+    static constexpr float RECOIL_RANDOMNESS = 0.35f;
+    static constexpr float RECOIL_MULT_EXPONENT = 0.35f;
+    static constexpr float RECOIL_STACK_CAP = 2.0f;
 
     Vector3f m_last_shoot_pos{};
     Vector3f m_last_shoot_dir{};
