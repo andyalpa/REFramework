@@ -71,7 +71,13 @@ private:
     const ModToggle::Ptr m_hide_arms{ ModToggle::create(generate_name("HideArms"), false) };
     const ModToggle::Ptr m_hide_upper_body_cutscenes{ ModToggle::create(generate_name("AutoHideUpperBodyCutscenes"), true) };
     const ModToggle::Ptr m_hide_lower_body_cutscenes{ ModToggle::create(generate_name("AutoHideLowerBodyCutscenes"), true) };
+    const ModToggle::Ptr m_recoil_enabled{ ModToggle::create(generate_name("RecoilEnabled"), true) };
     const ModSlider::Ptr m_recoil_intensity{ ModSlider::create(generate_name("RecoilIntensity"), 0.0f, 2.0f, 1.0f) };
+    const ModSlider::Ptr m_recoil_attack_duration{ ModSlider::create(generate_name("RecoilAttackDuration"), 0.005f, 0.06f, 0.02f) };
+    const ModSlider::Ptr m_recoil_spring_stiffness{ ModSlider::create(generate_name("RecoilSpringStiffness"), 80.0f, 250.0f, 160.0f) };
+    const ModSlider::Ptr m_recoil_spring_damping{ ModSlider::create(generate_name("RecoilSpringDamping"), 12.0f, 35.0f, 22.0f) };
+    const ModSlider::Ptr m_recoil_sustained_damping{ ModSlider::create(generate_name("RecoilSustainedDamping"), 24.0f, 45.0f, 32.0f) };
+    const ModSlider::Ptr m_recoil_sustained_window{ ModSlider::create(generate_name("RecoilSustainedWindow"), 0.06f, 0.25f, 0.12f) };
 
     ValueList m_options {
         *m_hide_upper_body,
@@ -79,7 +85,13 @@ private:
         *m_hide_arms,
         *m_hide_upper_body_cutscenes,
         *m_hide_lower_body_cutscenes,
-        *m_recoil_intensity
+        *m_recoil_enabled,
+        *m_recoil_intensity,
+        *m_recoil_attack_duration,
+        *m_recoil_spring_stiffness,
+        *m_recoil_spring_damping,
+        *m_recoil_sustained_damping,
+        *m_recoil_sustained_window
     };
 
     enum PlayerType {

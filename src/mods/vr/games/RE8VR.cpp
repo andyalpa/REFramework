@@ -133,7 +133,17 @@ void RE8VR::on_draw_ui() {
     m_hide_arms->draw("Hide Arms");
     m_hide_upper_body_cutscenes->draw("Auto Hide Upper Body in Cutscenes");
     m_hide_lower_body_cutscenes->draw("Auto Hide Lower Body in Cutscenes");
+    m_recoil_enabled->draw("Enable VR Recoil");
     m_recoil_intensity->draw("Recoil Intensity");
+    if (ImGui::CollapsingHeader("Recoil advanced", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Indent();
+        m_recoil_attack_duration->draw("Attack duration (s)");
+        m_recoil_spring_stiffness->draw("Spring stiffness");
+        m_recoil_spring_damping->draw("Spring damping");
+        m_recoil_sustained_damping->draw("Sustained fire damping");
+        m_recoil_sustained_window->draw("Sustained fire window (s)");
+        ImGui::Unindent();
+    }
 }
 
 void RE8VR::on_pre_application_entry(void* entry, const char* name, size_t hash) {
@@ -406,10 +416,12 @@ void RE8VR::update_hand_ik() {
     }
 
     // Recoil: apply to weapon (right hand) first; left hand follows in weapon space for two-handed grip.
-    const auto recoil_pos = get_recoil_position_offset_world(original_camera_rotation);
-    const auto recoil_rot = get_recoil_rotation_offset_world(original_camera_rotation);
-    rh_pos += Vector4f(recoil_pos, 0.0f);
-    rh_rotation = glm::normalize(recoil_rot * rh_rotation);
+    if (*m_recoil_enabled) {
+        const auto recoil_pos = get_recoil_position_offset_world(original_camera_rotation);
+        const auto recoil_rot = get_recoil_rotation_offset_world(original_camera_rotation);
+        rh_pos += Vector4f(recoil_pos, 0.0f);
+        rh_rotation = glm::normalize(recoil_rot * rh_rotation);
+    }
 
     if (m_was_gripping_weapon || m_is_reloading) {
         // Parent left hand to recoiled right hand: same spring-damper, 1:1 sync, no detach/jitter.
@@ -417,8 +429,12 @@ void RE8VR::update_hand_ik() {
         lh_pos.w = 1.0f;
         lh_rotation = glm::normalize(rh_rotation * original_left_rot_relative);
     } else {
-        lh_pos += Vector4f(recoil_pos, 0.0f);
-        lh_rotation = glm::normalize(recoil_rot * lh_rotation);
+        if (*m_recoil_enabled) {
+            const auto recoil_pos = get_recoil_position_offset_world(original_camera_rotation);
+            const auto recoil_rot = get_recoil_rotation_offset_world(original_camera_rotation);
+            lh_pos += Vector4f(recoil_pos, 0.0f);
+            lh_rotation = glm::normalize(recoil_rot * lh_rotation);
+        }
     }
 
     m_last_left_hand_position = lh_pos;
@@ -1449,6 +1465,9 @@ void RE8VR::apply_recoil_kickback() {
     if (!vr->is_hmd_active() || !vr->is_using_controllers()) {
         return;
     }
+    if (!*m_recoil_enabled) {
+        return;
+    }
     const float intensity = *m_recoil_intensity;
     if (intensity <= 0.0f) {
         return;
@@ -1510,11 +1529,18 @@ void RE8VR::update_recoil(float dt) {
     }
     m_recoil_last_t = now;
 
+    const float attack_dur_val = *m_recoil_attack_duration;
+    const float attack_duration = (attack_dur_val >= 0.001f) ? attack_dur_val : 0.001f;
+    const float k = *m_recoil_spring_stiffness;
+    const float c_base = *m_recoil_spring_damping;
+    const float c_sustained = *m_recoil_sustained_damping;
+    const float sustained_win_val = *m_recoil_sustained_window;
+    const float sustained_window = (sustained_win_val >= 0.01f) ? sustained_win_val : 0.01f;
+
     if (m_recoil_attack_active && dt > 0.0f) {
-        const float T = std::max(RECOIL_ATTACK_DURATION, 0.001f);
         m_recoil_attack_t += dt;
 
-        if (m_recoil_attack_t >= T) {
+        if (m_recoil_attack_t >= attack_duration) {
             m_recoil.spring_pos_y = m_recoil_attack_pos_y;
             m_recoil.spring_pos_z = m_recoil_attack_pos_z;
             m_recoil.spring_pitch = m_recoil_attack_pitch;
@@ -1530,7 +1556,7 @@ void RE8VR::update_recoil(float dt) {
             m_recoil_attack_t = 0.0f;
             m_recoil_attack_active = false;
         } else {
-            const float s = std::sin((m_recoil_attack_t / T) * pi_half);
+            const float s = std::sin((m_recoil_attack_t / attack_duration) * pi_half);
             m_recoil.spring_pos_y = m_recoil_attack_pos_y * s;
             m_recoil.spring_pos_z = m_recoil_attack_pos_z * s;
             m_recoil.spring_pitch = m_recoil_attack_pitch * s;
@@ -1543,19 +1569,17 @@ void RE8VR::update_recoil(float dt) {
     }
 
     if (!m_recoil_attack_active && dt > 0.0f) {
-        float c = RECOIL_SPRING_DAMPING;
+        float c = c_base;
         if (m_recoil_last_shot_t > 0.0f) {
             const float since_last = now - m_recoil_last_shot_t;
-            const float win = std::max(0.01f, RECOIL_SUSTAINED_WINDOW);
-            if (since_last < win) {
-                const float t_blend = 1.0f - (since_last / win);
-                c = c + (RECOIL_SUSTAINED_DAMPING - c) * t_blend;
+            if (since_last < sustained_window) {
+                const float t_blend = 1.0f - (since_last / sustained_window);
+                c = c + (c_sustained - c) * t_blend;
             }
         }
 
         const int steps = std::max(1, (int)(dt / RECOIL_SUBSTEP_DT));
         const float sub = dt / (float)steps;
-        const float k = RECOIL_SPRING_STIFFNESS;
 
         for (int i = 0; i < steps; ++i) {
             float ay = -k * m_recoil.spring_pos_y - c * m_recoil.spring_vel_y;
