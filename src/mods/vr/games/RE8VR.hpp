@@ -3,6 +3,8 @@
 
 #if defined(RE7) || defined(RE8)
 #include <chrono>
+#include <string>
+#include <unordered_map>
 #include <sdk/REMath.hpp>
 #include <reframework/API.h>
 
@@ -190,6 +192,9 @@ private:
     static constexpr float RECOIL_RANDOMNESS = 0.35f;
     static constexpr float RECOIL_MULT_EXPONENT = 0.35f;
     static constexpr float RECOIL_STACK_CAP = 2.0f;
+
+    /** Per-weapon recoil intensity multiplier. Key = type full name (e.g. "app.WeaponGunLemi"). Value = multiplier (default 1.0 = use global intensity). */
+    std::unordered_map<std::string, float> m_recoil_per_weapon{};
 
     Vector3f m_last_shoot_pos{};
     Vector3f m_last_shoot_dir{};

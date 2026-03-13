@@ -4,6 +4,8 @@
 #include <sdk/SceneManager.hpp>
 #include <sdk/MurmurHash.hpp>
 #include <sdk/Application.hpp>
+#include <sdk/REManagedObject.hpp>
+#include <sdk/RETypeDefinition.hpp>
 
 #include "HookManager.hpp"
 
@@ -50,11 +52,47 @@ void RE8VR::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
     }
+    const auto recoil_per_weapon_key = std::string{generate_name("RecoilPerWeapon")};
+    const auto saved = cfg.get<std::string>(recoil_per_weapon_key);
+    if (saved && !saved->empty()) {
+        m_recoil_per_weapon.clear();
+        std::string s = *saved;
+        size_t pos = 0;
+        while (pos < s.size()) {
+            const size_t eq = s.find('=', pos);
+            const size_t sem = s.find(';', pos);
+            if (eq == std::string::npos) {
+                break;
+            }
+            std::string type_name = s.substr(pos, eq - pos);
+            const size_t val_end = (sem != std::string::npos) ? sem : s.size();
+            float val = 1.0f;
+            try {
+                val = std::stof(s.substr(eq + 1, val_end - (eq + 1)));
+            } catch (...) {
+                val = 1.0f;
+            }
+            m_recoil_per_weapon[std::move(type_name)] = val;
+            pos = (sem != std::string::npos) ? sem + 1 : s.size();
+        }
+    }
 }
 
 void RE8VR::on_config_save(utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_save(cfg);
+    }
+    std::string serialized;
+    for (const auto& [type_name, val] : m_recoil_per_weapon) {
+        if (!serialized.empty()) {
+            serialized += ';';
+        }
+        serialized += type_name;
+        serialized += '=';
+        serialized += std::to_string(val);
+    }
+    if (!serialized.empty()) {
+        cfg.set<std::string>(generate_name("RecoilPerWeapon"), serialized);
     }
 }
 
@@ -142,6 +180,27 @@ void RE8VR::on_draw_ui() {
         m_recoil_spring_damping->draw("Spring damping");
         m_recoil_sustained_damping->draw("Sustained fire damping");
         m_recoil_sustained_window->draw("Sustained fire window (s)");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextUnformatted("Per-weapon intensity (RE7/RE8):");
+        if (m_weapon != nullptr) {
+            const auto* tdef = utility::re_managed_object::get_type_definition(m_weapon);
+            if (tdef != nullptr) {
+                const std::string type_name = tdef->get_full_name();
+                float per_weapon = 1.0f;
+                const auto it = m_recoil_per_weapon.find(type_name);
+                if (it != m_recoil_per_weapon.end()) {
+                    per_weapon = it->second;
+                }
+                if (ImGui::SliderFloat("Recoil intensity for current weapon", &per_weapon, 0.0f, 4.0f, "%.2f")) {
+                    m_recoil_per_weapon[type_name] = per_weapon;
+                    g_framework->request_save_config();
+                }
+                ImGui::Text("Weapon type: %s", type_name.c_str());
+            }
+        } else {
+            ImGui::TextUnformatted("No weapon equipped (hold a weapon to set its recoil intensity).");
+        }
         ImGui::Unindent();
     }
 }
@@ -1615,6 +1674,15 @@ void RE8VR::update_recoil(float dt) {
 float RE8VR::get_weapon_recoil_multiplier() const {
     if (m_weapon == nullptr) {
         return 1.0f;
+    }
+    const auto* tdef = utility::re_managed_object::get_type_definition(m_weapon);
+    if (tdef == nullptr) {
+        return 1.0f;
+    }
+    const std::string type_name = tdef->get_full_name();
+    const auto it = m_recoil_per_weapon.find(type_name);
+    if (it != m_recoil_per_weapon.end()) {
+        return it->second;
     }
     return 1.0f;
 }
