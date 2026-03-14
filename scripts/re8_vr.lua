@@ -79,6 +79,8 @@ local motion_get_world_rotation = sdk.find_type_definition("via.motion.Motion"):
 local cast_ray_method = sdk.find_type_definition("via.physics.System"):get_method("castRay(via.physics.CastRayQuery, via.physics.CastRayResult)")
 local cast_ray_async_method = sdk.find_type_definition("via.physics.System"):get_method("castRayAsync(via.physics.CastRayQuery, via.physics.CastRayResult)")
 
+local via_mesh_type = sdk.typeof("via.render.Mesh")
+
 local cfg_path = "re7_vr/main_config.json"
 
 local queue_recenter = false
@@ -94,6 +96,8 @@ local last_book_open_time = 0.0
 local last_shop_open_time = 0.0
 local last_map_open_time = 0.0
 local last_scope_time = 0.0
+-- When GUIScope was drawn more recently than this, we consider scope "active" (show weapon, etc.)
+local SCOPE_ACTIVE_THRESHOLD = 0.25
 local head_hash = nil
 
 local neg_forward_identity = Matrix4x4f.new(-1, 0, 0, 0,
@@ -107,6 +111,8 @@ local cfg = {
     disable_crosshair = false,
     no_melee_cooldown = false,
     roomscale_movement = true,
+    -- Keep weapon model visible while using telescopic sight (stops game from hiding it)
+    show_weapon_during_scope = true,
 }
 
 local function load_cfg()
@@ -1830,9 +1836,38 @@ re.on_application_entry("LockScene", function()
 
     update_muzzle_data()
 
+    -- Scope active = GUIScope was drawn recently (telescopic sight in use)
+    local scope_active = (os.clock() - last_scope_time) < SCOPE_ACTIVE_THRESHOLD
+    _G.vr_scope_active = scope_active
+
     if re8vr.last_shoot_pos then
         local pos = re8vr.last_shoot_pos + (re8vr.last_shoot_dir * 0.02)
         update_crosshair_world_pos(pos, pos + (re8vr.last_shoot_dir * 1000.0))
+    end
+
+    -- When using telescopic sight: keep weapon model visible (game often hides it) and optionally reparent
+    if scope_active and cfg.show_weapon_during_scope and re8vr.weapon and re8vr.transform then
+        local weapon_go = nil
+        if is_re7 then
+            weapon_go = re8vr.weapon:call("get_GameObject")
+        elseif is_re8 then
+            weapon_go = re8vr.weapon:get_field("<owner>k__BackingField")
+        end
+        if weapon_go and tostring(weapon_go) ~= "nil" then
+            local wp_tf = weapon_go:call("get_Transform")
+            if wp_tf then
+                local ok, parent = pcall(function() return wp_tf:call("get_Parent") end)
+                if not ok or not parent or tostring(parent) == "nil" then
+                    pcall(function() wp_tf:call("set_Parent", re8vr.transform) end)
+                end
+            end
+            if via_mesh_type then
+                local mesh = weapon_go:call("getComponent(System.Type)", via_mesh_type)
+                if mesh and tostring(mesh) ~= "nil" then
+                    pcall(function() mesh:call("setPartsEnable", 0, true) end)
+                end
+            end
+        end
     end
     
     --[[if not vrmod:is_hmd_active() then return end
@@ -2193,6 +2228,7 @@ re.on_draw_ui(function()
     changed, cfg.movement_shake = imgui.checkbox("Movement Shake", cfg.movement_shake)
     changed, cfg.all_camera_shake = imgui.checkbox("All Other Camera Shakes", cfg.all_camera_shake)
     changed, cfg.disable_crosshair = imgui.checkbox("Disable Crosshair", cfg.disable_crosshair)
+    changed, cfg.show_weapon_during_scope = imgui.checkbox("Show weapon during scope (telescopic sight)", cfg.show_weapon_during_scope)
     changed, cfg.roomscale_movement = imgui.checkbox("Roomscale Movement", cfg.roomscale_movement)
 
     if imgui.tree_node("Cheats") then
@@ -2219,6 +2255,18 @@ re.on_draw_ui(function()
     if imgui.tree_node("Debug") then
         changed, debug_adjust_hand_offset = imgui.checkbox("Adjust Hand Offset", debug_adjust_hand_offset)
         changed, debug_hands = imgui.checkbox("Debug Hands", debug_hands)
+        -- Show current weapon GameObject name (RE8/RE7: e.g. "ri3042_Inventory"; RE4: numeric ID)
+        if re8vr.weapon then
+            local weapon_go = is_re8 and re8vr.weapon:get_field("<owner>k__BackingField") or (is_re7 and re8vr.weapon:call("get_GameObject"))
+            local name_str = "?"
+            if weapon_go and tostring(weapon_go) ~= "nil" then
+                local ok, name = pcall(function() return weapon_go:call("get_Name") end)
+                if ok and name then name_str = name end
+            end
+            imgui.text("Current weapon GameObject: " .. tostring(name_str))
+        else
+            imgui.text("Current weapon GameObject: (none)")
+        end
 
         if debug_adjust_hand_offset then
             local left_axis = vrmod:get_left_stick_axis()
@@ -2534,6 +2582,10 @@ local scope_names = {
 for i, v in ipairs(scope_names) do
     scope_names[v] = true
 end
+
+-- RE8/RE7 weapon IDs: the game uses GameObject names like "ri3042_Inventory" for weapons in the scene.
+-- To verify: equip the weapon, open REFramework menu → Debug and check "Current weapon GameObject".
+-- RE4 uses numeric IDs (e.g. 4202) from get_EquipWeaponID instead.
 
 local shop_names = {
     "GUIShopBg",

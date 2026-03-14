@@ -1,13 +1,15 @@
 #if defined(RE7) || defined(RE8)
 #include <cstdlib>
 #include <cmath>
+#include <fstream>
 #include <sdk/SceneManager.hpp>
 #include <sdk/MurmurHash.hpp>
 #include <sdk/Application.hpp>
-#include <sdk/REManagedObject.hpp>
-#include <sdk/RETypeDefinition.hpp>
+#include <sdk/REGameObject.hpp>
+#include <json.hpp>
 
 #include "HookManager.hpp"
+#include "../../../REFramework.hpp"
 
 // Reminder: THIS MUST BE INCLUDED OR THE LOG FILE WILL BALLOON TO GIGANTIC SIZE
 // AND THE GAME MAY CRASH. THIS IS REQUIRED FOR THE sol_lua_push DECLARATION.
@@ -15,6 +17,8 @@
 #include "../../../mods/VR.hpp"
 
 #include "RE8VR.hpp"
+
+using json = nlohmann::json;
 
 std::shared_ptr<RE8VR>& RE8VR::get() {
     static auto inst = std::make_shared<RE8VR>();
@@ -52,47 +56,12 @@ void RE8VR::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
     }
-    const auto recoil_per_weapon_key = std::string{generate_name("RecoilPerWeapon")};
-    const auto saved = cfg.get<std::string>(recoil_per_weapon_key);
-    if (saved && !saved->empty()) {
-        m_recoil_per_weapon.clear();
-        std::string s = *saved;
-        size_t pos = 0;
-        while (pos < s.size()) {
-            const size_t eq = s.find('=', pos);
-            const size_t sem = s.find(';', pos);
-            if (eq == std::string::npos) {
-                break;
-            }
-            std::string type_name = s.substr(pos, eq - pos);
-            const size_t val_end = (sem != std::string::npos) ? sem : s.size();
-            float val = 1.0f;
-            try {
-                val = std::stof(s.substr(eq + 1, val_end - (eq + 1)));
-            } catch (...) {
-                val = 1.0f;
-            }
-            m_recoil_per_weapon[std::move(type_name)] = val;
-            pos = (sem != std::string::npos) ? sem + 1 : s.size();
-        }
-    }
+    load_recoil_settings();
 }
 
 void RE8VR::on_config_save(utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_save(cfg);
-    }
-    std::string serialized;
-    for (const auto& [type_name, val] : m_recoil_per_weapon) {
-        if (!serialized.empty()) {
-            serialized += ';';
-        }
-        serialized += type_name;
-        serialized += '=';
-        serialized += std::to_string(val);
-    }
-    if (!serialized.empty()) {
-        cfg.set<std::string>(generate_name("RecoilPerWeapon"), serialized);
     }
 }
 
@@ -150,7 +119,13 @@ void RE8VR::on_lua_state_created(sol::state& lua) {
         "fix_player_camera", &RE8VR::fix_player_camera,
         "fix_player_shadow", &RE8VR::fix_player_shadow,
         "get_localplayer", &RE8VR::get_localplayer,
-        "get_weapon_object", &RE8VR::get_weapon_object);
+        "get_weapon_object", &RE8VR::get_weapon_object,
+        "get_weapon_recoil_id", &RE8VR::get_weapon_recoil_id,
+        "get_current_weapon_recoil_id", &RE8VR::get_current_weapon_recoil_id,
+        "set_per_weapon_recoil_intensity", &RE8VR::set_per_weapon_recoil_intensity,
+        "get_per_weapon_recoil_intensity", &RE8VR::get_per_weapon_recoil_intensity,
+        "load_recoil_settings", &RE8VR::load_recoil_settings,
+        "save_recoil_settings", &RE8VR::save_recoil_settings);
 
     lua["re8vr"] = this;
 }
@@ -172,7 +147,27 @@ void RE8VR::on_draw_ui() {
     m_hide_upper_body_cutscenes->draw("Auto Hide Upper Body in Cutscenes");
     m_hide_lower_body_cutscenes->draw("Auto Hide Lower Body in Cutscenes");
     m_recoil_enabled->draw("Enable VR Recoil");
-    m_recoil_intensity->draw("Recoil Intensity");
+    m_recoil_intensity->draw("Recoil Intensity (1–4)");
+
+    // Per-weapon recoil: menu integration with Lua config. Current weapon + slider; save writes recoil_settings.json.
+    if (ImGui::CollapsingHeader("Per-weapon recoil", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Indent();
+        const std::string current_id = get_current_weapon_recoil_id();
+        if (current_id.empty()) {
+            ImGui::TextUnformatted("Current weapon: (none equipped)");
+        } else {
+            ImGui::Text("Current weapon: %s", current_id.c_str());
+            float per_weapon = get_per_weapon_recoil_intensity(current_id);
+            if (ImGui::SliderFloat("Weapon recoil intensity (1–4)", &per_weapon, 1.0f, 4.0f, "%.2f")) {
+                set_per_weapon_recoil_intensity(current_id, per_weapon);
+            }
+            if (ImGui::Button("Save recoil settings")) {
+                save_recoil_settings();
+            }
+        }
+        ImGui::Unindent();
+    }
+
     if (ImGui::CollapsingHeader("Recoil advanced", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent();
         m_recoil_attack_duration->draw("Attack duration (s)");
@@ -180,27 +175,6 @@ void RE8VR::on_draw_ui() {
         m_recoil_spring_damping->draw("Spring damping");
         m_recoil_sustained_damping->draw("Sustained fire damping");
         m_recoil_sustained_window->draw("Sustained fire window (s)");
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::TextUnformatted("Per-weapon intensity (RE7/RE8):");
-        if (m_weapon != nullptr) {
-            const auto* tdef = utility::re_managed_object::get_type_definition(m_weapon);
-            if (tdef != nullptr) {
-                const std::string type_name = tdef->get_full_name();
-                float per_weapon = 1.0f;
-                const auto it = m_recoil_per_weapon.find(type_name);
-                if (it != m_recoil_per_weapon.end()) {
-                    per_weapon = it->second;
-                }
-                if (ImGui::SliderFloat("Recoil intensity for current weapon", &per_weapon, 0.0f, 4.0f, "%.2f")) {
-                    m_recoil_per_weapon[type_name] = per_weapon;
-                    g_framework->request_save_config();
-                }
-                ImGui::Text("Weapon type: %s", type_name.c_str());
-            }
-        } else {
-            ImGui::TextUnformatted("No weapon equipped (hold a weapon to set its recoil intensity).");
-        }
         ImGui::Unindent();
     }
 }
@@ -1520,6 +1494,10 @@ void RE8VR::post_shadow_late_update(uintptr_t& ret_val, sdk::RETypeDefinition* r
 }
 
 void RE8VR::apply_recoil_kickback() {
+    apply_recoil_kickback(m_weapon);
+}
+
+void RE8VR::apply_recoil_kickback(::REManagedObject* weapon_for_id) {
     auto& vr = VR::get();
     if (!vr->is_hmd_active() || !vr->is_using_controllers()) {
         return;
@@ -1532,32 +1510,47 @@ void RE8VR::apply_recoil_kickback() {
         return;
     }
 
-    const float weapon_mult = get_weapon_recoil_multiplier();
+    // Per-weapon intensity (1–4, default 1). Use the weapon that is actually firing for the lookup when called from the shoot hook.
+    const float weapon_mult = get_weapon_recoil_multiplier(weapon_for_id);
     if (weapon_mult <= 0.0f) {
         return;
     }
 
     const float random_factor = 1.0f + (std::rand() / (float)RAND_MAX - 0.5f) * RECOIL_RANDOMNESS;
-    const float exp = std::max(0.1f, std::min(1.0f, RECOIL_MULT_EXPONENT));
-    const float total_mult = std::pow(weapon_mult, exp) * random_factor * intensity;
+    const float total_mult = weapon_mult * random_factor * intensity;
 
+    // [0, 1) uniform per shot; separate rand() so pitch, yaw, and position vary independently
+    auto rnd = [](float& u) { u = std::rand() / (float)(RAND_MAX + 1u); };
+    float u1, u2, u3, u4, u5;
+    rnd(u1); rnd(u2); rnd(u3); rnd(u4); rnd(u5);
+
+    // Position kick: mostly back and up, with per-shot variation so direction isn't identical every time
     const float pos_peak = RECOIL_POSITION_INTENSITY * total_mult;
-    const float new_pos_y = pos_peak * 0.6f;
-    const float new_pos_z = -pos_peak;
+    const float pos_y_scale = 0.5f + 0.25f * u1;   // up component 0.5–0.75
+    const float pos_z_scale = 0.9f + 0.2f * u2;    // back component 0.9–1.1
+    const float new_pos_y = pos_peak * pos_y_scale;
+    const float new_pos_z = -pos_peak * pos_z_scale;
 
-    const float pitch_peak = RECOIL_ROTATION_INTENSITY * total_mult
-        + (std::rand() / (float)RAND_MAX - 0.5f) * RECOIL_VERTICAL_SPREAD * total_mult;
-    const float yaw_peak = (std::rand() / (float)RAND_MAX - 0.5f) * 2.0f * RECOIL_HORIZONTAL_SPREAD * total_mult;
+    // Pitch (vertical): dominant upward, with magnitude variation per shot (0.8–1.2) and a small symmetric spread so it's not always the same amount
+    const float pitch_base = RECOIL_ROTATION_INTENSITY * total_mult * (0.8f + 0.4f * u3);
+    const float pitch_spread = (u4 - 0.5f) * 2.0f * RECOIL_VERTICAL_SPREAD * total_mult;  // [-spread, +spread]
+    const float pitch_peak = pitch_base + pitch_spread;
+
+    // Yaw (horizontal): symmetric left/right, uniformly distributed so recoil goes left and right equally often (avoid upward+right bias). Slightly scaled up so left/right are noticeable alongside dominant up.
+    const float yaw_signed = (u5 - 0.5f) * 2.0f;  // [-1, 1) uniform
+    const float yaw_peak = yaw_signed * RECOIL_HORIZONTAL_SPREAD * total_mult * 1.25f;
 
     m_recoil_attack_pos_y += new_pos_y;
     m_recoil_attack_pos_z += new_pos_z;
     m_recoil_attack_pitch += pitch_peak;
     m_recoil_attack_yaw += yaw_peak;
 
+    // Scale the stack cap by total_mult so higher per-weapon/global intensity allows visibly more recoil (was fixed cap so all intensities looked the same).
     if (RECOIL_STACK_CAP > 0.0f) {
-        const float cap_pos = RECOIL_POSITION_INTENSITY * RECOIL_STACK_CAP;
-        const float cap_rot = RECOIL_ROTATION_INTENSITY * RECOIL_STACK_CAP;
-        const float cap_yaw = RECOIL_HORIZONTAL_SPREAD * RECOIL_STACK_CAP;
+        const float cap_scale = RECOIL_STACK_CAP * total_mult;
+        const float cap_pos = RECOIL_POSITION_INTENSITY * cap_scale;
+        const float cap_rot = RECOIL_ROTATION_INTENSITY * cap_scale;
+        const float cap_yaw = RECOIL_HORIZONTAL_SPREAD * cap_scale;
         m_recoil_attack_pos_y = std::min(m_recoil_attack_pos_y, cap_pos * 0.6f);
         m_recoil_attack_pos_z = std::max(m_recoil_attack_pos_z, -cap_pos);
         m_recoil_attack_pitch = std::min(m_recoil_attack_pitch, cap_rot);
@@ -1574,9 +1567,35 @@ void RE8VR::apply_recoil_kickback() {
     m_recoil_last_shot_t = now;
 }
 
+void RE8VR::cancel_recoil_state() {
+    m_recoil = {};
+    m_recoil_attack_active = false;
+    m_recoil_attack_t = 0.0f;
+    m_recoil_attack_pos_y = 0.0f;
+    m_recoil_attack_pos_z = 0.0f;
+    m_recoil_attack_pitch = 0.0f;
+    m_recoil_attack_yaw = 0.0f;
+    m_recoil_active = false;
+    m_recoil_last_t = 0.0f;
+}
+
 void RE8VR::update_recoil(float dt) {
     constexpr float pi_half = 1.5707963267948966f;
     dt = std::min(dt, 0.05f);
+
+    // Cancel recoil when weapon has no ammo so the view doesn't stay kicked
+    if (m_weapon != nullptr && get_weapon_ammo_count(m_weapon) == 0) {
+        m_recoil = {};
+        m_recoil_attack_active = false;
+        m_recoil_attack_t = 0.0f;
+        m_recoil_attack_pos_y = 0.0f;
+        m_recoil_attack_pos_z = 0.0f;
+        m_recoil_attack_pitch = 0.0f;
+        m_recoil_attack_yaw = 0.0f;
+        m_recoil_active = false;
+        m_recoil_last_t = 0.0f;
+        return;
+    }
 
     if (!m_recoil_active && !m_recoil_attack_active) {
         return;
@@ -1671,20 +1690,111 @@ void RE8VR::update_recoil(float dt) {
     }
 }
 
-float RE8VR::get_weapon_recoil_multiplier() const {
-    if (m_weapon == nullptr) {
+std::string RE8VR::get_weapon_recoil_id(::REManagedObject* weapon) const {
+    if (weapon == nullptr) {
+        return {};
+    }
+    // Weapon ID mapping: stable per-weapon identifier for recoil config. RE7 and RE8 use different structures.
+#ifdef RE8
+    // RE8: weapon is app.WeaponGunCore; type name is not unique. Use owner GameObject name (e.g. "ri3042_Inventory").
+    auto owner_ptr = sdk::get_object_field<::REGameObject*>(weapon, "<owner>k__BackingField");
+    if (owner_ptr != nullptr && *owner_ptr != nullptr) {
+        std::string name = utility::re_game_object::get_name(*owner_ptr);
+        if (!name.empty()) {
+            return name;
+        }
+    }
+#else
+    // RE7: weapon is app.WeaponGun; use the weapon's own GameObject name (get_GameObject()) to identify the gun type.
+    auto* go = sdk::call_object_func_easy<::REGameObject*>(weapon, "get_GameObject");
+    if (go != nullptr) {
+        std::string name = utility::re_game_object::get_name(go);
+        if (!name.empty()) {
+            return name;
+        }
+    }
+#endif
+    // Fallback to type name if owner/GameObject name unavailable
+    auto* tdef = utility::re_managed_object::get_type_definition(weapon);
+    if (tdef != nullptr) {
+        return tdef->get_full_name();
+    }
+    return {};
+}
+
+std::string RE8VR::get_current_weapon_recoil_id() const {
+    return get_weapon_recoil_id(m_weapon);
+}
+
+void RE8VR::set_per_weapon_recoil_intensity(const std::string& weapon_id, float intensity) {
+    if (weapon_id.empty()) {
+        return;
+    }
+    intensity = std::max(1.0f, std::min(4.0f, intensity));
+    m_per_weapon_recoil_intensity[weapon_id] = intensity;
+}
+
+float RE8VR::get_per_weapon_recoil_intensity(const std::string& weapon_id) const {
+    if (weapon_id.empty()) {
         return 1.0f;
     }
-    const auto* tdef = utility::re_managed_object::get_type_definition(m_weapon);
-    if (tdef == nullptr) {
-        return 1.0f;
-    }
-    const std::string type_name = tdef->get_full_name();
-    const auto it = m_recoil_per_weapon.find(type_name);
-    if (it != m_recoil_per_weapon.end()) {
+    auto it = m_per_weapon_recoil_intensity.find(weapon_id);
+    if (it != m_per_weapon_recoil_intensity.end()) {
         return it->second;
     }
     return 1.0f;
+}
+
+void RE8VR::load_recoil_settings() {
+    const auto path = REFramework::get_persistent_dir() / "reframework" / "data" / RECOIL_SETTINGS_FILENAME;
+    std::ifstream f(path);
+    if (!f) {
+        return;
+    }
+    try {
+        json j = json::parse(f);
+        m_per_weapon_recoil_intensity.clear();
+        if (j.contains("weapons") && j["weapons"].is_object()) {
+            for (auto& [key, val] : j["weapons"].items()) {
+                if (val.is_object() && val.contains("intensity") && val["intensity"].is_number()) {
+                    float v = val["intensity"].get<float>();
+                    m_per_weapon_recoil_intensity[key] = std::max(1.0f, std::min(4.0f, v));
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[RE8VR] load_recoil_settings: {}", e.what());
+    }
+}
+
+void RE8VR::save_recoil_settings() {
+    const auto path = REFramework::get_persistent_dir() / "reframework" / "data" / RECOIL_SETTINGS_FILENAME;
+    try {
+        std::filesystem::create_directories(path.parent_path());
+        json j = json::object();
+        j["weapons"] = json::object();
+        for (const auto& [weapon_id, intensity] : m_per_weapon_recoil_intensity) {
+            j["weapons"][weapon_id] = json::object({ {"intensity", intensity} });
+        }
+        std::ofstream f(path);
+        if (f) {
+            f << j.dump(2);
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[RE8VR] save_recoil_settings: {}", e.what());
+    }
+}
+
+float RE8VR::get_weapon_recoil_multiplier() const {
+    return get_weapon_recoil_multiplier(m_weapon);
+}
+
+float RE8VR::get_weapon_recoil_multiplier(::REManagedObject* weapon) const {
+    if (weapon == nullptr) {
+        return 1.0f;
+    }
+    const float weapon_intensity = get_per_weapon_recoil_intensity(get_weapon_recoil_id(weapon));
+    return weapon_intensity;
 }
 
 Vector3f RE8VR::get_recoil_position_offset_world(const glm::quat& camera_rotation) const {
@@ -1700,6 +1810,49 @@ glm::quat RE8VR::get_recoil_rotation_offset_world(const glm::quat& camera_rotati
     return camera_rotation * pitch_rot * yaw_rot * glm::inverse(camera_rotation);
 }
 
+int32_t RE8VR::get_weapon_ammo_count(::REManagedObject* weapon) const {
+    if (weapon == nullptr) {
+        return -1;
+    }
+    auto try_obj = [](::REManagedObject* obj) -> int32_t {
+        if (obj == nullptr) return -1;
+        auto* tdef = utility::re_managed_object::get_type_definition(obj);
+        if (tdef == nullptr) return -1;
+        static const char* field_names[] = {
+            "<RemainBullet>k__BackingField", "RemainBullet", "_RemainBullet",
+            "<CurrentBullet>k__BackingField", "CurrentBullet", "Num", "<Num>k__BackingField"
+        };
+        for (const char* name : field_names) {
+            auto* pi32 = sdk::get_object_field<int32_t>(obj, name, false);
+            if (pi32 != nullptr) return *pi32;
+            auto* pu32 = sdk::get_object_field<uint32_t>(obj, name, false);
+            if (pu32 != nullptr) return (int32_t)*pu32;
+        }
+        static const char* method_names[] = {
+            "get_RemainBullet", "get_CurrentBullet", "get_remainBullet",
+            "get_RemainNum", "get_CurrentNum", "get_LeftBullet", "get_NumRemain", "get_Num"
+        };
+        for (const char* method_name : method_names) {
+            auto* method = tdef->get_method(method_name);
+            if (method != nullptr) {
+                try {
+                    return method->call<int32_t>(sdk::get_thread_context(), obj);
+                } catch (...) { break; }
+            }
+        }
+        return -1;
+    };
+    int32_t v = try_obj(weapon);
+    if (v >= 0) return v;
+#ifdef RE8
+    // RE8: ammo may be on the weapon's "work" object (e.g. InstanceWork). RE7 app.WeaponGun may not have get_work.
+    auto* work = sdk::call_object_func_easy<::REManagedObject*>(weapon, "get_work");
+    return try_obj(work);
+#else
+    return -1;
+#endif
+}
+
 HookManager::PreHookResult RE8VR::pre_weapon_shoot(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr) {
     auto& re8vr = RE8VR::get();
     if (re8vr->m_player == nullptr || re8vr->m_weapon == nullptr) {
@@ -1713,11 +1866,20 @@ HookManager::PreHookResult RE8VR::pre_weapon_shoot(std::vector<uintptr_t>& args,
     if (weapon_this != current_weapon) {
         return HookManager::PreHookResult::CALL_ORIGINAL;
     }
-    re8vr->apply_recoil_kickback();
+    // No recoil when weapon has no ammo (empty click or ran out mid-burst)
+    if (re8vr->get_weapon_ammo_count(weapon_this) == 0) {
+        return HookManager::PreHookResult::CALL_ORIGINAL;
+    }
+    re8vr->apply_recoil_kickback(weapon_this);
     return HookManager::PreHookResult::CALL_ORIGINAL;
 }
 
 void RE8VR::post_weapon_shoot(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr) {
+    // When shoot() returns false (no ammo / didn't fire), cancel recoil so dry fire doesn't kick the view
+    if (ret_ty != nullptr && ret_val == 0) {
+        auto& re8vr = RE8VR::get();
+        re8vr->cancel_recoil_state();
+    }
 }
 
 void RE8VR::update_heal_gesture() {

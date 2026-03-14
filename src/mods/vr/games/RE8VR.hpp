@@ -45,11 +45,27 @@ public:
     void slerp_gui(const glm::quat& new_gui_quat);
 
     void apply_recoil_kickback();
+    /// Use when called from shoot hook so the multiplier is looked up from the actual shooting weapon.
+    void apply_recoil_kickback(::REManagedObject* weapon_for_id);
+    /// Cancel all recoil state (e.g. when shoot() did not actually fire because of no ammo).
+    void cancel_recoil_state();
     void update_recoil(float dt);
     Vector3f get_recoil_position_offset_world(const glm::quat& camera_rotation) const;
     glm::quat get_recoil_rotation_offset_world(const glm::quat& camera_rotation) const;
 
+    /// Global intensity is multiplied by per-weapon intensity. Returns effective multiplier for current weapon (uses m_weapon).
     float get_weapon_recoil_multiplier() const;
+    /// Look up per-weapon intensity for a specific weapon (e.g. the one firing).
+    float get_weapon_recoil_multiplier(::REManagedObject* weapon) const;
+
+    /// Weapon ID mapping: stable string from weapon object's type (e.g. "app.WeaponGunLemi"). Used for per-weapon recoil config.
+    std::string get_weapon_recoil_id(::REManagedObject* weapon) const;
+    /// Current equipped weapon's recoil ID; empty if none.
+    std::string get_current_weapon_recoil_id() const;
+    void set_per_weapon_recoil_intensity(const std::string& weapon_id, float intensity);
+    float get_per_weapon_recoil_intensity(const std::string& weapon_id) const;
+    void load_recoil_settings();
+    void save_recoil_settings();
 
     ::REManagedObject* get_localplayer() const;
     ::REManagedObject* get_weapon_object(::REGameObject* player) const;
@@ -58,8 +74,12 @@ public:
     bool update_ik_pointers();
 
 private:
+    /// Returns current ammo count, or -1 if unknown (no recoil cancel). Used to skip recoil when weapon has no ammo.
+    int32_t get_weapon_ammo_count(::REManagedObject* weapon) const;
+
     void update_block_gesture();
     void update_heal_gesture();
+    void update_shoulder_holster_gesture();
 
     static HookManager::PreHookResult pre_weapon_shoot(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr);
     static void post_weapon_shoot(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr);
@@ -74,7 +94,8 @@ private:
     const ModToggle::Ptr m_hide_upper_body_cutscenes{ ModToggle::create(generate_name("AutoHideUpperBodyCutscenes"), true) };
     const ModToggle::Ptr m_hide_lower_body_cutscenes{ ModToggle::create(generate_name("AutoHideLowerBodyCutscenes"), true) };
     const ModToggle::Ptr m_recoil_enabled{ ModToggle::create(generate_name("RecoilEnabled"), true) };
-    const ModSlider::Ptr m_recoil_intensity{ ModSlider::create(generate_name("RecoilIntensity"), 0.0f, 2.0f, 1.0f) };
+    /// Global recoil intensity. Range 1–4; per-weapon intensity multiplies this (see per-weapon recoil section).
+    const ModSlider::Ptr m_recoil_intensity{ ModSlider::create(generate_name("RecoilIntensity"), 1.0f, 4.0f, 1.0f) };
     const ModSlider::Ptr m_recoil_attack_duration{ ModSlider::create(generate_name("RecoilAttackDuration"), 0.005f, 0.06f, 0.02f) };
     const ModSlider::Ptr m_recoil_spring_stiffness{ ModSlider::create(generate_name("RecoilSpringStiffness"), 80.0f, 250.0f, 160.0f) };
     const ModSlider::Ptr m_recoil_spring_damping{ ModSlider::create(generate_name("RecoilSpringDamping"), 12.0f, 35.0f, 22.0f) };
@@ -193,9 +214,6 @@ private:
     static constexpr float RECOIL_MULT_EXPONENT = 0.35f;
     static constexpr float RECOIL_STACK_CAP = 2.0f;
 
-    /** Per-weapon recoil intensity multiplier. Key = type full name (e.g. "app.WeaponGunLemi"). Value = multiplier (default 1.0 = use global intensity). */
-    std::unordered_map<std::string, float> m_recoil_per_weapon{};
-
     Vector3f m_last_shoot_pos{};
     Vector3f m_last_shoot_dir{};
     Vector3f m_last_muzzle_pos{};
@@ -241,5 +259,9 @@ private:
     };
 
     static constexpr inline auto GUI_MAX_SLERP_TIME = 1.5f;
+
+    /// Per-weapon recoil intensity multiplier (key = weapon type full name). Default 1.0 if not present. Persisted via recoil_settings.json.
+    std::unordered_map<std::string, float> m_per_weapon_recoil_intensity{};
+    static constexpr const char* RECOIL_SETTINGS_FILENAME = "recoil_settings.json";
 };
 #endif
