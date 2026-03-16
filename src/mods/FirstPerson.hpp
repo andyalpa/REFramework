@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include "Mod.hpp"
 #include "utility/Patch.hpp"
@@ -61,6 +64,21 @@ public:
         return m_last_camera_matrix;
     }
 
+    // VR recoil (RE2/RE3)
+    void add_pending_recoil_shot();
+    void apply_recoil_kickback();
+    void apply_recoil_kickback(::REManagedObject* weapon_for_id, bool two_handed = false, bool trigger_vibration = true);
+    void cancel_recoil_state();
+    void update_recoil(float dt);
+    Vector3f get_recoil_position_offset_world(const glm::quat& camera_rotation) const;
+    glm::quat get_recoil_rotation_offset_world(const glm::quat& camera_rotation) const;
+    std::string get_weapon_recoil_id(::REManagedObject* weapon) const;
+    std::string get_current_weapon_recoil_id() const;
+    void set_per_weapon_recoil_intensity(const std::string& weapon_id, float intensity);
+    float get_per_weapon_recoil_intensity(const std::string& weapon_id) const;
+    void load_recoil_settings();
+    void save_recoil_settings();
+
 protected:
     // gross
     bool list_box_handler_attach(void* data, int idx, const char** out_text) {
@@ -87,6 +105,9 @@ private:
     float update_delta_time(REComponent* component);
     bool is_first_person_allowed() const;
     bool is_jacked(RETransform* transform) const;
+    int32_t get_weapon_ammo_count(::REManagedObject* weapon) const;
+    float get_weapon_recoil_multiplier(::REManagedObject* weapon) const;
+    ::REManagedObject* get_current_equipment_weapon(RETransform* transform) const;
 
     // Needs to be recursive for some reason. Otherwise freeze.
     std::recursive_mutex m_matrix_mutex{};
@@ -166,6 +187,46 @@ private:
     bool m_was_hmd_active{false};
     bool m_was_gripping_weapon{false};
 
+    // VR recoil state (RE2/RE3)
+    struct RecoilState {
+        float spring_pos_y{0.0f};
+        float spring_pos_z{0.0f};
+        float spring_vel_y{0.0f};
+        float spring_vel_z{0.0f};
+        float spring_pitch{0.0f};
+        float spring_vel_pitch{0.0f};
+        float spring_yaw{0.0f};
+        float spring_vel_yaw{0.0f};
+    };
+    RecoilState m_recoil{};
+    bool m_recoil_attack_active{false};
+    float m_recoil_attack_t{0.0f};
+    float m_recoil_attack_pos_y{0.0f};
+    float m_recoil_attack_pos_z{0.0f};
+    float m_recoil_attack_pitch{0.0f};
+    float m_recoil_attack_yaw{0.0f};
+    float m_recoil_last_shot_t{0.0f};
+    float m_recoil_last_t{0.0f};
+    bool m_recoil_active{false};
+    std::atomic<int> m_pending_recoil_shots{0};
+    int m_pending_vibration_count{0}; // deferred to update_player_arm_ik so we have two_handed
+    static constexpr float RECOIL_ATTACK_DURATION = 0.008f;
+    static constexpr float RECOIL_SPRING_STIFFNESS = 160.0f;
+    static constexpr float RECOIL_SPRING_DAMPING = 22.0f;
+    static constexpr float RECOIL_SUSTAINED_DAMPING = 32.0f;
+    static constexpr float RECOIL_SUSTAINED_WINDOW = 0.12f;
+    static constexpr float RECOIL_SUBSTEP_DT = 0.008f;
+    // RE2/RE3 arm IK scale: use stronger base values so recoil is visible in world space
+    static constexpr float RECOIL_POSITION_INTENSITY = 0.028f;
+    static constexpr float RECOIL_ROTATION_INTENSITY = 0.18f;
+    static constexpr float RECOIL_HORIZONTAL_SPREAD = 0.035f;
+    static constexpr float RECOIL_VERTICAL_SPREAD = 0.022f;
+    static constexpr float RECOIL_RANDOMNESS = 0.35f;
+    static constexpr float RECOIL_STACK_CAP = 2.0f;
+    std::unordered_map<std::string, float> m_per_weapon_recoil_intensity{};
+    static constexpr const char* RECOIL_SETTINGS_FILENAME = "recoil_settings.json";
+    int32_t m_recoil_last_ammo_count{-1};
+    ::REManagedObject* m_recoil_last_weapon{nullptr};
 
     const ModToggle::Ptr m_smooth_xz_movement{ ModToggle::create(generate_name("SmoothXZMovementVR"), true) };
     const ModToggle::Ptr m_smooth_y_movement{ ModToggle::create(generate_name("SmoothYMovementVR"), true) };
@@ -183,6 +244,17 @@ private:
 
     const ModSlider::Ptr m_camera_scale{ ModSlider::create(generate_name("CameraSpeed"), 0.0f, 100.0f, 40.0f) };
     const ModSlider::Ptr m_bone_scale{ ModSlider::create(generate_name("CameraShake"), 0.0f, 100.0f, 15.0f) };
+
+    const ModToggle::Ptr m_recoil_enabled{ ModToggle::create(generate_name("VRRecoilEnabled"), true) };
+    const ModSlider::Ptr m_recoil_intensity{ ModSlider::create(generate_name("VRRecoilIntensity"), 1.0f, 4.0f, 3.0f) };
+    const ModSlider::Ptr m_recoil_attack_duration{ ModSlider::create(generate_name("VRRecoilAttackDuration"), 0.001f, 0.05f, 0.008f) };
+    const ModSlider::Ptr m_recoil_spring_stiffness{ ModSlider::create(generate_name("VRRecoilSpringStiffness"), 50.0f, 300.0f, 160.0f) };
+    const ModSlider::Ptr m_recoil_spring_damping{ ModSlider::create(generate_name("VRRecoilSpringDamping"), 5.0f, 50.0f, 22.0f) };
+    const ModSlider::Ptr m_recoil_sustained_damping{ ModSlider::create(generate_name("VRRecoilSustainedDamping"), 10.0f, 50.0f, 32.0f) };
+    const ModSlider::Ptr m_recoil_sustained_window{ ModSlider::create(generate_name("VRRecoilSustainedWindow"), 0.01f, 0.5f, 0.12f) };
+    const ModToggle::Ptr m_recoil_vibration_enabled{ ModToggle::create(generate_name("VRRecoilVibrationEnabled"), true) };
+    const ModSlider::Ptr m_recoil_vibration_duration{ ModSlider::create(generate_name("VRRecoilVibrationDuration"), 0.01f, 0.2f, 0.05f) };
+    const ModSlider::Ptr m_recoil_vibration_intensity{ ModSlider::create(generate_name("VRRecoilVibrationIntensity"), 0.0f, 1.0f, 0.4f) };
 
     // just used to draw. not actually stored in config
     const ModFloat::Ptr m_current_fov{ ModFloat::create("") };
@@ -204,7 +276,17 @@ private:
         *m_camera_scale,
         *m_bone_scale,
         *m_current_fov,
-        *m_roomscale
+        *m_roomscale,
+        *m_recoil_enabled,
+        *m_recoil_intensity,
+        *m_recoil_attack_duration,
+        *m_recoil_spring_stiffness,
+        *m_recoil_spring_damping,
+        *m_recoil_sustained_damping,
+        *m_recoil_sustained_window,
+        *m_recoil_vibration_enabled,
+        *m_recoil_vibration_duration,
+        *m_recoil_vibration_intensity
     };
 };
 

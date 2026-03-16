@@ -1,18 +1,50 @@
 #include <unordered_set>
+#include <fstream>
+#include <filesystem>
 
 #include <spdlog/spdlog.h>
 #include <imgui.h>
+#include <json.hpp>
 
 #include "utility/Scan.hpp"
 #include "REFramework.hpp"
 #include "sdk/REMath.hpp"
 #include "sdk/MurmurHash.hpp"
 #include "sdk/Application.hpp"
+#include "sdk/REManagedObject.hpp"
+#include "sdk/REGameObject.hpp"
 
 #include "VR.hpp"
 #include "FirstPerson.hpp"
+#include "HookManager.hpp"
 
 #if defined(RE2) || defined(RE3)
+
+using json = nlohmann::json;
+
+namespace {
+    HookManager::PreHookResult pre_weapon_fire(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr) {
+        auto* vr = VR::get().get();
+        if (vr == nullptr || !vr->is_hmd_active() || !vr->is_using_controllers()) {
+            return HookManager::PreHookResult::CALL_ORIGINAL;
+        }
+        auto& fp_ref = FirstPerson::get();
+        if (!fp_ref) {
+            return HookManager::PreHookResult::CALL_ORIGINAL;
+        }
+        fp_ref->add_pending_recoil_shot();
+        return HookManager::PreHookResult::CALL_ORIGINAL;
+    }
+
+    void post_weapon_fire(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr) {
+        if (ret_ty != nullptr && ret_val == 0) {
+            auto& fp_ref = FirstPerson::get();
+            if (fp_ref) {
+                fp_ref->cancel_recoil_state();
+            }
+        }
+    }
+}
 
 FirstPerson* g_first_person = nullptr;
 
@@ -67,6 +99,40 @@ std::optional<std::string> FirstPerson::on_initialize() {
     // xor eax, eax
     m_disable_vignettePatch = Patch::create(*vignetteCode, { 0x31, 0xC0, 0x90, 0x90, 0x90, 0x90 }, false);*/
 
+    load_recoil_settings();
+
+    // Hook weapon fire for VR recoil (RE2/RE3). Prefer Equipment.requestFire (RE2); fallback to shell generator requestFire.
+    try {
+        auto equipment_t = sdk::find_type_definition(game_namespace("survivor.Equipment"));
+        if (equipment_t != nullptr) {
+            auto request_fire = equipment_t->get_method("requestFire");
+            if (request_fire != nullptr) {
+                g_hookman.add(request_fire, &pre_weapon_fire, &post_weapon_fire);
+                spdlog::info("[FirstPerson] Hooked survivor.Equipment.requestFire for VR recoil");
+            }
+        }
+        if (equipment_t == nullptr || equipment_t->get_method("requestFire") == nullptr) {
+            auto bullet_gen_t = sdk::find_type_definition(game_namespace("weapon.generator.BulletShellGenerator"));
+            if (bullet_gen_t != nullptr) {
+                auto request_fire = bullet_gen_t->get_method("requestFire");
+                if (request_fire != nullptr) {
+                    g_hookman.add(request_fire, &pre_weapon_fire, &post_weapon_fire);
+                    spdlog::info("[FirstPerson] Hooked BulletShellGenerator.requestFire for VR recoil");
+                }
+            }
+            auto shotgun_gen_t = sdk::find_type_definition(game_namespace("weapon.generator.ShotgunShellGenerator"));
+            if (shotgun_gen_t != nullptr) {
+                auto request_fire = shotgun_gen_t->get_method("requestFire");
+                if (request_fire != nullptr) {
+                    g_hookman.add(request_fire, &pre_weapon_fire, &post_weapon_fire);
+                    spdlog::info("[FirstPerson] Hooked ShotgunShellGenerator.requestFire for VR recoil");
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[FirstPerson] Recoil fire hook setup: {}", e.what());
+    }
+
     return Mod::on_initialize();
 }
 
@@ -108,6 +174,36 @@ void FirstPerson::on_draw_ui() {
     m_smooth_xz_movement->draw("Smooth XZ Movement (VR)");
     m_smooth_y_movement->draw("Smooth Y Movement (VR)");
     m_roomscale->draw("Roomscale Movement (VR)");
+
+    if (ImGui::CollapsingHeader("VR Recoil", ImGuiTreeNodeFlags_DefaultOpen)) {
+        m_recoil_enabled->draw("Enable VR Recoil");
+        m_recoil_intensity->draw("Recoil Intensity (1-4)");
+        m_recoil_vibration_enabled->draw("Vibration on shoot");
+        if (*m_recoil_vibration_enabled) {
+            m_recoil_vibration_duration->draw("Vibration duration (s)");
+            m_recoil_vibration_intensity->draw("Vibration intensity");
+        }
+        if (ImGui::CollapsingHeader("Recoil advanced", ImGuiTreeNodeFlags_None)) {
+            m_recoil_attack_duration->draw("Attack duration (s)");
+            m_recoil_spring_stiffness->draw("Spring stiffness");
+            m_recoil_spring_damping->draw("Spring damping");
+            m_recoil_sustained_damping->draw("Sustained fire damping");
+            m_recoil_sustained_window->draw("Sustained fire window (s)");
+        }
+        const std::string current_id = get_current_weapon_recoil_id();
+        if (current_id.empty()) {
+            ImGui::TextUnformatted("Current weapon: (none equipped)");
+        } else {
+            ImGui::Text("Current weapon: %s", current_id.c_str());
+            float per_weapon = get_per_weapon_recoil_intensity(current_id);
+            if (ImGui::SliderFloat("Weapon recoil intensity (1-4)", &per_weapon, 1.0f, 4.0f, "%.2f")) {
+                set_per_weapon_recoil_intensity(current_id, per_weapon);
+            }
+            if (ImGui::Button("Save recoil settings")) {
+                save_recoil_settings();
+            }
+        }
+    }
 
     static bool adjust_hand_offset{false};
     ImGui::Checkbox("Adjust Hand Offset", &adjust_hand_offset);
@@ -231,7 +327,12 @@ void FirstPerson::on_lua_state_created(sol::state& state) {
         "new", sol::no_constructor,
         "is_enabled", &FirstPerson::is_enabled,
         "will_be_used", &FirstPerson::will_be_used,
-        "on_pre_flashlight_apply_transform", &FirstPerson::on_pre_flashlight_apply_transform
+        "on_pre_flashlight_apply_transform", &FirstPerson::on_pre_flashlight_apply_transform,
+        "get_current_weapon_recoil_id", &FirstPerson::get_current_weapon_recoil_id,
+        "set_per_weapon_recoil_intensity", &FirstPerson::set_per_weapon_recoil_intensity,
+        "get_per_weapon_recoil_intensity", &FirstPerson::get_per_weapon_recoil_intensity,
+        "load_recoil_settings", &FirstPerson::load_recoil_settings,
+        "save_recoil_settings", &FirstPerson::save_recoil_settings
     );
 
     state["firstpersonmod"] = this;
@@ -272,6 +373,7 @@ void FirstPerson::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
     }
+    load_recoil_settings();
 
     m_last_fov_mult = m_fov_mult->value();
 
@@ -292,6 +394,7 @@ void FirstPerson::on_config_save(utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_save(cfg);
     }
+    save_recoil_settings();
 }
 
 thread_local bool g_in_player_transform = false;
@@ -538,6 +641,21 @@ void FirstPerson::on_post_update_motion(void* entry, bool true_motion) {
     }
 
     if (m_player_transform != nullptr) {
+        // Consume pending recoil shots BEFORE update_player_vr so that when update_player_arm_ik
+        // runs inside it, the attack is already set and update_recoil() can integrate and apply it
+        // to the hands in the same frame. Otherwise the first shot's recoil was applied after
+        // update_player_arm_ik had already run, so it only showed on the next frame (or when rapid-firing).
+        if (*m_recoil_enabled && VR::get()->is_hmd_active() && VR::get()->is_using_controllers()) {
+            int pending = m_pending_recoil_shots.exchange(0);
+            if (pending > 0) {
+                if (pending > 10) pending = 10;
+                auto* weapon = get_current_equipment_weapon(m_player_transform);
+                m_pending_vibration_count = pending; // defer vibration to update_player_arm_ik where we know two_handed
+                for (int i = 0; i < pending; ++i) {
+                    apply_recoil_kickback(weapon, false, false); // no vibration here
+                }
+            }
+        }
         if (m_camera_system != nullptr && m_camera_system->mainCamera != nullptr && m_camera_system->mainCamera->ownerGameObject != nullptr) {
             auto player_object = m_player_transform->ownerGameObject;
 
@@ -937,6 +1055,78 @@ void FirstPerson::update_player_arm_ik(RETransform* transform) {
             lh_pos = lh_pos;
             lh_rotation = lh_rotation;
         }
+    }
+
+    // VR recoil: update state and apply to hand poses before IK (same pattern as RE8VR).
+    const glm::quat recoil_camera_rotation = glm::normalize(glm::quat{m_last_controller_rotation_vr});
+    const float dt = via_motion != nullptr ? update_delta_time(via_motion) : (1.0f / 60.0f);
+
+    ::REManagedObject* current_weapon = get_current_equipment_weapon(transform);
+    int pending = m_pending_recoil_shots.exchange(0);
+    const bool two_handed = m_was_gripping_weapon || is_reloading;
+    const bool apply_pending = (pending > 0 && *m_recoil_enabled);
+    if (apply_pending) {
+        if (pending > 10) {
+            pending = 10;
+        }
+        for (int i = 0; i < pending; ++i) {
+            apply_recoil_kickback(current_weapon, two_handed);
+        }
+    }
+
+    if (*m_recoil_enabled && is_using_controllers) {
+        const int32_t ammo = current_weapon != nullptr ? get_weapon_ammo_count(current_weapon) : -1;
+        if (!apply_pending && current_weapon != nullptr && ammo >= 0 && current_weapon == m_recoil_last_weapon
+            && m_recoil_last_ammo_count >= 0 && ammo < m_recoil_last_ammo_count) {
+            const int32_t shots_fired = m_recoil_last_ammo_count - ammo;
+            for (int32_t i = 0; i < shots_fired && i < 10; ++i) {
+                apply_recoil_kickback(current_weapon, two_handed, false); // no vibration: already triggered from pending
+            }
+        }
+        m_recoil_last_weapon = current_weapon;
+        m_recoil_last_ammo_count = ammo;
+    } else {
+        if (!*m_recoil_enabled) {
+            m_pending_recoil_shots.store(0);
+        }
+        m_recoil_last_weapon = nullptr;
+        m_recoil_last_ammo_count = -1;
+        m_pending_vibration_count = 0; // don't trigger deferred vibration when recoil/controllers off
+    }
+
+    // Trigger deferred vibration here so we have two_handed (right only when one-handed, both when two-handed).
+    if (m_pending_vibration_count > 0 && *m_recoil_vibration_enabled && VR::get()->is_hmd_active() && VR::get()->is_using_controllers()) {
+        auto* vr = VR::get().get();
+        const float duration = *m_recoil_vibration_duration;
+        const float weapon_mult = get_weapon_recoil_multiplier(current_weapon);
+        const float amplitude = std::min(1.0f, *m_recoil_vibration_intensity * (weapon_mult > 0.0f ? weapon_mult : 1.0f));
+        const float frequency = 1.0f;
+        const int n = (m_pending_vibration_count > 10) ? 10 : m_pending_vibration_count;
+        for (int i = 0; i < n; ++i) {
+            vr->trigger_haptic_vibration(0.0f, duration, frequency, amplitude, vr->get_right_joystick());
+            if (two_handed) {
+                vr->trigger_haptic_vibration(0.0f, duration, frequency, amplitude * 0.7f, vr->get_left_joystick());
+            }
+        }
+        m_pending_vibration_count = 0;
+    }
+
+    update_recoil(dt);
+    // Apply recoil to hands only when weapon has ammo; keeps hands/weapon stable when firing with empty mag.
+    const bool weapon_has_ammo = current_weapon != nullptr && get_weapon_ammo_count(current_weapon) > 0;
+    if (*m_recoil_enabled && weapon_has_ammo) {
+        const auto recoil_pos = get_recoil_position_offset_world(recoil_camera_rotation);
+        const auto recoil_rot = get_recoil_rotation_offset_world(recoil_camera_rotation);
+        // Recoil always applies to the right (weapon) hand.
+        rh_pos += Vector4f(recoil_pos, 0.0f);
+        rh_rotation = glm::normalize(recoil_rot * rh_rotation);
+        // Left hand only follows recoil when supporting the weapon (two-handed grip or reloading).
+        if (m_was_gripping_weapon || is_reloading) {
+            lh_pos = rh_pos + (glm::normalize(rh_rotation) * original_left_pos_relative);
+            lh_pos.w = 1.0f;
+            lh_rotation = glm::normalize(rh_rotation * original_left_rot_relative);
+        }
+        // One-handed: left hand is unchanged by recoil.
     }
 
     auto update_joint = [&](uint32_t hash, int32_t controller_index, glm::quat& rotation_quat, Vector4f& new_pos) {
@@ -1929,8 +2119,403 @@ bool FirstPerson::is_jacked(RETransform* transform) const {
     return false;
 }
 
+::REManagedObject* FirstPerson::get_current_equipment_weapon(RETransform* transform) const {
+    if (transform == nullptr) {
+        return nullptr;
+    }
+    static auto equipment_t = sdk::find_type_definition(game_namespace("survivor.Equipment"));
+    auto equipment = utility::re_component::find<REComponent>(transform, equipment_t->get_type());
+    if (equipment == nullptr) {
+        return nullptr;
+    }
+    auto main_weapon_field = equipment_t->get_field("<EquipWeapon>k__BackingField");
+    return main_weapon_field->get_data<REManagedObject*>(equipment);
+}
+
+int32_t FirstPerson::get_weapon_ammo_count(::REManagedObject* weapon) const {
+    if (weapon == nullptr) {
+        return -1;
+    }
+    auto* tdef = utility::re_managed_object::get_type_definition(weapon);
+    if (tdef == nullptr) {
+        return -1;
+    }
+    auto try_obj = [tdef](::REManagedObject* obj) -> int32_t {
+        if (obj == nullptr) return -1;
+        auto* td = utility::re_managed_object::get_type_definition(obj);
+        if (td == nullptr) return -1;
+        static const char* field_names[] = {
+            "<RemainBullet>k__BackingField", "RemainBullet", "_RemainBullet",
+            "<CurrentBullet>k__BackingField", "CurrentBullet", "Num", "<Num>k__BackingField",
+            "RemainNum", "<RemainNum>k__BackingField", "CurrentNum", "<CurrentNum>k__BackingField",
+            "WpBulletCounter", "HiddenAmmoNum"
+        };
+        for (const char* name : field_names) {
+            auto* pi32 = sdk::get_object_field<int32_t>(obj, name, false);
+            if (pi32 != nullptr) return *pi32;
+            auto* pu32 = sdk::get_object_field<uint32_t>(obj, name, false);
+            if (pu32 != nullptr) return (int32_t)*pu32;
+            auto* pf = sdk::get_object_field<float>(obj, name, false);
+            if (pf != nullptr) return (int32_t)*pf;
+        }
+        static const char* method_names[] = {
+            "get_RemainBullet", "get_CurrentBullet", "get_remainBullet",
+            "get_RemainNum", "get_CurrentNum", "get_LeftBullet", "get_NumRemain", "get_Num",
+            "get_Number"
+        };
+        for (const char* method_name : method_names) {
+            auto* method = td->get_method(method_name);
+            if (method != nullptr) {
+                try {
+                    return method->call<int32_t>(sdk::get_thread_context(), obj);
+                } catch (...) { break; }
+            }
+        }
+        // RE2 GunUserData: WpBulletCounter is float
+        auto* wp_bullet_method = td->get_method("get_WpBulletCounter");
+        if (wp_bullet_method != nullptr) {
+            try {
+                return (int32_t)wp_bullet_method->call<float>(sdk::get_thread_context(), obj);
+            } catch (...) {}
+        }
+        return -1;
+    };
+    int32_t v = try_obj(weapon);
+    if (v >= 0) return v;
+    // RE2/RE3: ammo may be on UserData (GunUserData.WpBulletCounter) or on a "work" sub-object
+    auto* user_data = sdk::call_object_func_easy<::REManagedObject*>(weapon, "get_UserData");
+    if (user_data != nullptr) v = try_obj(user_data);
+    if (v >= 0) return v;
+    // RE2: EquipWeapon is Arm; Gun extends Arm. If this is an Arm that holds a Gun, get_Gun() and read ammo from it.
+    auto* gun = sdk::call_object_func_easy<::REManagedObject*>(weapon, "get_Gun");
+    if (gun != nullptr && gun != weapon) {
+        v = try_obj(gun);
+        if (v >= 0) return v;
+        auto* gun_user_data = sdk::call_object_func_easy<::REManagedObject*>(gun, "get_UserData");
+        if (gun_user_data != nullptr) v = try_obj(gun_user_data);
+        if (v >= 0) return v;
+    }
+    auto* work = sdk::call_object_func_easy<::REManagedObject*>(weapon, "get_work");
+    if (work != nullptr) v = try_obj(work);
+    if (v >= 0) return v;
+    auto* work2 = sdk::get_object_field<::REManagedObject*>(weapon, "<Work>k__BackingField");
+    if (work2 != nullptr && *work2 != nullptr) v = try_obj(*work2);
+    return v;
+}
+
+std::string FirstPerson::get_weapon_recoil_id(::REManagedObject* weapon) const {
+    if (weapon == nullptr) {
+        return {};
+    }
+    auto* go = sdk::call_object_func_easy<::REGameObject*>(weapon, "get_GameObject");
+    if (go != nullptr) {
+        std::string name = utility::re_game_object::get_name(go);
+        if (!name.empty()) {
+            return name;
+        }
+    }
+    auto* tdef = utility::re_managed_object::get_type_definition(weapon);
+    if (tdef != nullptr) {
+        return tdef->get_full_name();
+    }
+    return {};
+}
+
+std::string FirstPerson::get_current_weapon_recoil_id() const {
+    return get_weapon_recoil_id(get_current_equipment_weapon(m_player_transform));
+}
+
+float FirstPerson::get_weapon_recoil_multiplier(::REManagedObject* weapon) const {
+    if (weapon == nullptr) {
+        return 1.0f;
+    }
+    std::string id = get_weapon_recoil_id(weapon);
+    return get_per_weapon_recoil_intensity(id);
+}
+
+void FirstPerson::set_per_weapon_recoil_intensity(const std::string& weapon_id, float intensity) {
+    if (weapon_id.empty()) {
+        return;
+    }
+    intensity = std::max(1.0f, std::min(4.0f, intensity));
+    m_per_weapon_recoil_intensity[weapon_id] = intensity;
+}
+
+float FirstPerson::get_per_weapon_recoil_intensity(const std::string& weapon_id) const {
+    if (weapon_id.empty()) {
+        return 1.0f;
+    }
+    auto it = m_per_weapon_recoil_intensity.find(weapon_id);
+    if (it != m_per_weapon_recoil_intensity.end()) {
+        return it->second;
+    }
+    return 1.0f;
+}
+
+void FirstPerson::load_recoil_settings() {
+    try {
+        const auto path = REFramework::get_persistent_dir() / "reframework" / "data" / RECOIL_SETTINGS_FILENAME;
+        std::ifstream f(path);
+        if (!f) {
+            return;
+        }
+        json j = json::parse(f);
+        m_per_weapon_recoil_intensity.clear();
+        if (j.contains("weapons") && j["weapons"].is_object()) {
+            for (auto& [key, val] : j["weapons"].items()) {
+                if (val.is_object() && val.contains("intensity") && val["intensity"].is_number()) {
+                    float v = val["intensity"].get<float>();
+                    m_per_weapon_recoil_intensity[key] = std::max(1.0f, std::min(4.0f, v));
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[FirstPerson] load_recoil_settings: {}", e.what());
+    }
+}
+
+void FirstPerson::save_recoil_settings() {
+    try {
+        const auto path = REFramework::get_persistent_dir() / "reframework" / "data" / RECOIL_SETTINGS_FILENAME;
+        std::filesystem::create_directories(path.parent_path());
+        json j = json::object();
+        j["weapons"] = json::object();
+        for (const auto& [weapon_id, intensity] : m_per_weapon_recoil_intensity) {
+            j["weapons"][weapon_id] = json::object({ {"intensity", intensity} });
+        }
+        std::ofstream f(path);
+        if (f) {
+            f << j.dump(2);
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[FirstPerson] save_recoil_settings: {}", e.what());
+    }
+}
+
+void FirstPerson::add_pending_recoil_shot() {
+    int v = m_pending_recoil_shots.load(std::memory_order_relaxed);
+    if (v < 20) {
+        m_pending_recoil_shots.store(v + 1, std::memory_order_relaxed);
+    }
+}
+
+void FirstPerson::apply_recoil_kickback() {
+    apply_recoil_kickback(get_current_equipment_weapon(m_player_transform), false);
+}
+
+void FirstPerson::apply_recoil_kickback(::REManagedObject* weapon_for_id, bool two_handed, bool trigger_vibration) {
+    auto& vr = VR::get();
+    if (!vr->is_hmd_active() || !vr->is_using_controllers()) {
+        return;
+    }
+    if (!*m_recoil_enabled) {
+        return;
+    }
+    const float intensity = *m_recoil_intensity;
+    if (intensity <= 0.0f) {
+        return;
+    }
+    const float weapon_mult = get_weapon_recoil_multiplier(weapon_for_id);
+    if (weapon_mult <= 0.0f) {
+        return;
+    }
+    // Do not gate on ammo here: the game may decrement ammo before we read it, which would skip
+    // recoil on the first (or every) shot. Empty-mag stability is handled by not applying recoil
+    // offsets to hands when weapon_has_ammo is false in update_player_arm_ik.
+    const float random_factor = 1.0f + (std::rand() / (float)RAND_MAX - 0.5f) * RECOIL_RANDOMNESS;
+    const float total_mult = weapon_mult * random_factor * intensity;
+
+    auto rnd = [](float& u) { u = std::rand() / (float)(RAND_MAX + 1u); };
+    float u1, u2, u3, u4, u5;
+    rnd(u1); rnd(u2); rnd(u3); rnd(u4); rnd(u5);
+
+    const float pos_peak = RECOIL_POSITION_INTENSITY * total_mult;
+    const float pos_y_scale = 0.5f + 0.25f * u1;
+    const float pos_z_scale = 0.9f + 0.2f * u2;
+    const float new_pos_y = pos_peak * pos_y_scale;
+    const float new_pos_z = -pos_peak * pos_z_scale;
+
+    const float pitch_base = RECOIL_ROTATION_INTENSITY * total_mult * (0.8f + 0.4f * u3);
+    const float pitch_spread = (u4 - 0.5f) * 2.0f * RECOIL_VERTICAL_SPREAD * total_mult;
+    const float pitch_peak = pitch_base + pitch_spread;
+
+    const float yaw_signed = (u5 - 0.5f) * 2.0f;
+    const float yaw_peak = yaw_signed * RECOIL_HORIZONTAL_SPREAD * total_mult * 1.25f;
+
+    m_recoil_attack_pos_y += new_pos_y;
+    m_recoil_attack_pos_z += new_pos_z;
+    m_recoil_attack_pitch += pitch_peak;
+    m_recoil_attack_yaw += yaw_peak;
+
+    if (RECOIL_STACK_CAP > 0.0f) {
+        const float cap_scale = RECOIL_STACK_CAP * total_mult;
+        const float cap_pos = RECOIL_POSITION_INTENSITY * cap_scale;
+        const float cap_rot = RECOIL_ROTATION_INTENSITY * cap_scale;
+        const float cap_yaw = RECOIL_HORIZONTAL_SPREAD * cap_scale;
+        m_recoil_attack_pos_y = std::min(m_recoil_attack_pos_y, cap_pos * 0.6f);
+        m_recoil_attack_pos_z = std::max(m_recoil_attack_pos_z, -cap_pos);
+        m_recoil_attack_pitch = std::min(m_recoil_attack_pitch, cap_rot);
+        m_recoil_attack_yaw = std::max(-cap_yaw, std::min(cap_yaw, m_recoil_attack_yaw));
+    }
+
+    m_recoil_attack_t = 0.0f;
+    m_recoil_attack_active = true;
+    m_recoil_active = true;
+    const float now = (float)std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (m_recoil_last_t == 0.0f) {
+        m_recoil_last_t = now;
+    }
+    m_recoil_last_shot_t = now;
+
+    // Optional controller vibration: right hand always, left only when two-handed. Only when from fire signal (pending), not ammo fallback.
+    if (trigger_vibration && *m_recoil_vibration_enabled && vr->is_hmd_active() && vr->is_using_controllers()) {
+        const float duration = *m_recoil_vibration_duration;
+        const float amplitude = std::min(1.0f, *m_recoil_vibration_intensity * weapon_mult);
+        const float frequency = 1.0f;
+        vr->trigger_haptic_vibration(0.0f, duration, frequency, amplitude, vr->get_right_joystick());
+        if (two_handed) {
+            vr->trigger_haptic_vibration(0.0f, duration, frequency, amplitude * 0.7f, vr->get_left_joystick());
+        }
+    }
+}
+
+void FirstPerson::cancel_recoil_state() {
+    m_recoil = {};
+    m_recoil_attack_active = false;
+    m_recoil_attack_t = 0.0f;
+    m_recoil_attack_pos_y = 0.0f;
+    m_recoil_attack_pos_z = 0.0f;
+    m_recoil_attack_pitch = 0.0f;
+    m_recoil_attack_yaw = 0.0f;
+    m_recoil_active = false;
+    m_recoil_last_t = 0.0f;
+}
+
+void FirstPerson::update_recoil(float dt) {
+    constexpr float pi_half = 1.5707963267948966f;
+    dt = std::min(dt, 0.05f);
+
+    ::REManagedObject* current_weapon = get_current_equipment_weapon(m_player_transform);
+    // When ammo is 0, clear recoil only if we're not in the middle of an attack (let current kick finish).
+    if (current_weapon != nullptr && get_weapon_ammo_count(current_weapon) == 0 && !m_recoil_attack_active) {
+        m_recoil = {};
+        m_recoil_attack_t = 0.0f;
+        m_recoil_attack_pos_y = 0.0f;
+        m_recoil_attack_pos_z = 0.0f;
+        m_recoil_attack_pitch = 0.0f;
+        m_recoil_attack_yaw = 0.0f;
+        m_recoil_active = false;
+        m_recoil_last_t = 0.0f;
+        return;
+    }
+
+    if (!m_recoil_active && !m_recoil_attack_active) {
+        return;
+    }
+
+    const float now = (float)std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (m_recoil_last_t > 0.0f) {
+        dt = std::min(now - m_recoil_last_t, 0.05f);
+    }
+    m_recoil_last_t = now;
+
+    const float attack_dur_val = *m_recoil_attack_duration;
+    const float attack_duration = (attack_dur_val >= 0.001f) ? attack_dur_val : 0.001f;
+    const float k = *m_recoil_spring_stiffness;
+    const float c_base = *m_recoil_spring_damping;
+    const float c_sustained = *m_recoil_sustained_damping;
+    const float sustained_win_val = *m_recoil_sustained_window;
+    const float sustained_window = (sustained_win_val >= 0.01f) ? sustained_win_val : 0.01f;
+
+    if (m_recoil_attack_active && dt > 0.0f) {
+        m_recoil_attack_t += dt;
+
+        if (m_recoil_attack_t >= attack_duration) {
+            m_recoil.spring_pos_y = m_recoil_attack_pos_y;
+            m_recoil.spring_pos_z = m_recoil_attack_pos_z;
+            m_recoil.spring_pitch = m_recoil_attack_pitch;
+            m_recoil.spring_yaw = m_recoil_attack_yaw;
+            m_recoil.spring_vel_y = 0.0f;
+            m_recoil.spring_vel_z = 0.0f;
+            m_recoil.spring_vel_pitch = 0.0f;
+            m_recoil.spring_vel_yaw = 0.0f;
+            m_recoil_attack_pos_y = 0.0f;
+            m_recoil_attack_pos_z = 0.0f;
+            m_recoil_attack_pitch = 0.0f;
+            m_recoil_attack_yaw = 0.0f;
+            m_recoil_attack_t = 0.0f;
+            m_recoil_attack_active = false;
+        } else {
+            const float s = std::sin((m_recoil_attack_t / attack_duration) * pi_half);
+            m_recoil.spring_pos_y = m_recoil_attack_pos_y * s;
+            m_recoil.spring_pos_z = m_recoil_attack_pos_z * s;
+            m_recoil.spring_pitch = m_recoil_attack_pitch * s;
+            m_recoil.spring_yaw = m_recoil_attack_yaw * s;
+            m_recoil.spring_vel_y = 0.0f;
+            m_recoil.spring_vel_z = 0.0f;
+            m_recoil.spring_vel_pitch = 0.0f;
+            m_recoil.spring_vel_yaw = 0.0f;
+        }
+    }
+
+    if (!m_recoil_attack_active && dt > 0.0f) {
+        float c = c_base;
+        if (m_recoil_last_shot_t > 0.0f) {
+            const float since_last = now - m_recoil_last_shot_t;
+            if (since_last < sustained_window) {
+                const float t_blend = 1.0f - (since_last / sustained_window);
+                c = c + (c_sustained - c) * t_blend;
+            }
+        }
+
+        const int steps = std::max(1, (int)(dt / RECOIL_SUBSTEP_DT));
+        const float sub = dt / (float)steps;
+
+        for (int i = 0; i < steps; ++i) {
+            float ay = -k * m_recoil.spring_pos_y - c * m_recoil.spring_vel_y;
+            m_recoil.spring_vel_y += ay * sub;
+            m_recoil.spring_pos_y += m_recoil.spring_vel_y * sub;
+
+            float az = -k * m_recoil.spring_pos_z - c * m_recoil.spring_vel_z;
+            m_recoil.spring_vel_z += az * sub;
+            m_recoil.spring_pos_z += m_recoil.spring_vel_z * sub;
+
+            float ap = -k * m_recoil.spring_pitch - c * m_recoil.spring_vel_pitch;
+            m_recoil.spring_vel_pitch += ap * sub;
+            m_recoil.spring_pitch += m_recoil.spring_vel_pitch * sub;
+
+            float aw = -k * m_recoil.spring_yaw - c * m_recoil.spring_vel_yaw;
+            m_recoil.spring_vel_yaw += aw * sub;
+            m_recoil.spring_yaw += m_recoil.spring_vel_yaw * sub;
+        }
+
+        const float pos_mag = std::abs(m_recoil.spring_pos_y) + std::abs(m_recoil.spring_pos_z);
+        const float rot_mag = std::abs(m_recoil.spring_pitch) + std::abs(m_recoil.spring_yaw);
+        const float vel_mag = std::abs(m_recoil.spring_vel_y) + std::abs(m_recoil.spring_vel_z)
+            + std::abs(m_recoil.spring_vel_pitch) + std::abs(m_recoil.spring_vel_yaw);
+
+        if (pos_mag < 0.00005f && rot_mag < 0.0002f && vel_mag < 0.001f) {
+            m_recoil = {};
+            m_recoil_active = false;
+            m_recoil_last_t = 0.0f;
+        }
+    }
+}
+
+Vector3f FirstPerson::get_recoil_position_offset_world(const glm::quat& camera_rotation) const {
+    const Vector3f local_offset(0.0f, m_recoil.spring_pos_y, -m_recoil.spring_pos_z);
+    return camera_rotation * local_offset;
+}
+
+glm::quat FirstPerson::get_recoil_rotation_offset_world(const glm::quat& camera_rotation) const {
+    const glm::quat pitch_rot = glm::angleAxis(m_recoil.spring_pitch, Vector3f{1.0f, 0.0f, 0.0f});
+    const glm::quat yaw_rot = glm::angleAxis(m_recoil.spring_yaw, Vector3f{0.0f, 1.0f, 0.0f});
+    return camera_rotation * pitch_rot * yaw_rot * glm::inverse(camera_rotation);
+}
+
 void FirstPerson::on_disabled() {
     m_was_gripping_weapon = false;
+    cancel_recoil_state();
 
     VR::get()->set_rotation_offset(glm::identity<glm::quat>());
 
