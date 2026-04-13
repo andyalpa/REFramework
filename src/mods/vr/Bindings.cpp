@@ -122,6 +122,26 @@ std::string VR::actions_json = R"(
       "type": "boolean"
     },
     {
+      "name": "/actions/default/in/JoystickTouch",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/default/in/TriggerTouch",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/default/in/AButtonTouch",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/default/in/BButtonTouch",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/default/in/ThumbrestTouch",
+      "type": "boolean"
+    },
+    {
       "name": "/actions/default/out/Haptic",
       "type": "vibration"
     }
@@ -246,6 +266,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/trigger"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/triggertouch"
                   }
                },
                "mode" : "button",
@@ -255,6 +278,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/weapondial_start"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/triggertouch"
                   }
                },
                "mode" : "button",
@@ -264,6 +290,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/trigger"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/triggertouch"
                   }
                },
                "mode" : "button",
@@ -291,6 +320,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/abutton"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/abuttontouch"
                   }
                },
                "mode" : "button",
@@ -300,6 +332,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/abutton"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/abuttontouch"
                   }
                },
                "mode" : "button",
@@ -309,6 +344,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/bbutton"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/bbuttontouch"
                   }
                },
                "mode" : "button",
@@ -318,6 +356,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/bbutton"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/bbuttontouch"
                   }
                },
                "mode" : "button",
@@ -327,6 +368,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/abutton"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/abuttontouch"
                   }
                },
                "mode" : "button",
@@ -336,6 +380,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/re3_dodge"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/abuttontouch"
                   }
                },
                "mode" : "button",
@@ -348,6 +395,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                   },
                   "position" : {
                      "output" : "/actions/default/in/joystick"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/joysticktouch"
                   }
                },
                "mode" : "joystick",
@@ -360,6 +410,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                   },
                   "position" : {
                      "output" : "/actions/default/in/joystick"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/joysticktouch"
                   }
                },
                "mode" : "joystick",
@@ -369,6 +422,9 @@ std::string VR::bindings_oculus_touch_json = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/bbutton"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/bbuttontouch"
                   }
                },
                "mode" : "button",
