@@ -257,6 +257,7 @@ public:
     static inline std::vector<std::string> s_supported_controllers {
         "/interaction_profiles/khr/simple_controller",
         "/interaction_profiles/oculus/touch_controller",
+        "/interaction_profiles/meta/touch_controller_plus",
         "/interaction_profiles/oculus/go_controller",
         "/interaction_profiles/valve/index_controller",
         "/interaction_profiles/microsoft/motion_controller",
