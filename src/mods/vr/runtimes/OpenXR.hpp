@@ -221,6 +221,13 @@ public:
         {"/user/hand/*/input/b/click", "bbutton"}, // oculus?
         {"/user/hand/*/input/thumbstick", "joystick"}, // oculus?
         {"/user/hand/*/input/thumbstick/click", "joystickclick"}, // oculus?
+        {"/user/hand/*/input/thumbstick/touch", "joysticktouch"},
+        {"/user/hand/*/input/trigger/touch", "triggertouch"},
+        {"/user/hand/*/input/x/touch", "abuttontouch"},
+        {"/user/hand/*/input/y/touch", "bbuttontouch"},
+        {"/user/hand/*/input/a/touch", "abuttontouch"},
+        {"/user/hand/*/input/b/touch", "bbuttontouch"},
+        {"/user/hand/*/input/thumbrest/touch", "thumbresttouch"},
         {"/user/hand/*/input/system/click", "systembutton"}, // oculus/vive/index
         {"/user/hand/*/input/menu/click", "systembutton"}, // oculus/vive/index
 
