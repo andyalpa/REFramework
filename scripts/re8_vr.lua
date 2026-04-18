@@ -25,6 +25,7 @@ local openxr = {
 }
 
 local is_openxr = vrmod:is_openxr_loaded()
+local last_is_openxr = is_openxr
 
 local last_original_right_hand_rotation = Quaternion.new(0.0, 0.0, 0.0, 0.0)
 local last_camera_matrix = Matrix4x4f.new()
@@ -32,26 +33,53 @@ local last_camera_matrix = Matrix4x4f.new()
 local left_hand_rotation_vec = Vector3f.new(-0.105 + 0.2, 2.37, 1.10) -- pitch yaw roll?
 local right_hand_rotation_vec = Vector3f.new(-0.105, -2.37, -1.10) -- pitch yaw roll?
 
-if is_openxr then
-    left_hand_rotation_vec = openxr.left_hand_rotation_vec:clone()
-    right_hand_rotation_vec = openxr.right_hand_rotation_vec:clone()
+-- These are used by the UI controls later; keep locals in sync with re8vr fields.
+local left_hand_rotation_offset = Quaternion.identity()
+local right_hand_rotation_offset = Quaternion.identity()
+local left_hand_position_offset = Vector4f.new(0.0, 0.0, 0.0, 0.0)
+local right_hand_position_offset = Vector4f.new(0.0, 0.0, 0.0, 0.0)
+
+local function compute_hand_offsets(openxr_active)
+    local l_rot_vec = Vector3f.new(-0.105 + 0.2, 2.37, 1.10) -- pitch yaw roll?
+    local r_rot_vec = Vector3f.new(-0.105, -2.37, -1.10) -- pitch yaw roll?
+
+    local l_pos_off = Vector4f.new(-0.025, 0.045, 0.155, 0.0)
+    local r_pos_off = Vector4f.new(0.025, 0.045, 0.155, 0.0)
+
+    if openxr_active then
+        l_rot_vec = openxr.left_hand_rotation_vec:clone()
+        r_rot_vec = openxr.right_hand_rotation_vec:clone()
+        l_pos_off = openxr.left_hand_position_offset:clone()
+        r_pos_off = openxr.right_hand_position_offset:clone()
+    end
+
+    return Quaternion.new(l_rot_vec):normalized(), Quaternion.new(r_rot_vec):normalized(), l_pos_off, r_pos_off
 end
 
-local left_hand_rotation_offset = Quaternion.new(left_hand_rotation_vec):normalized()
-local right_hand_rotation_offset = Quaternion.new(right_hand_rotation_vec):normalized()
+local function sync_hand_offsets_if_needed(force)
+    -- RE7 startup issue: OpenXR can report "not loaded" briefly, then become active.
+    -- If we compute offsets too early, hand rotation feels wrong until scripts are reset.
+    local openxr_now = vrmod:is_openxr_loaded()
+    if not force and openxr_now == last_is_openxr then
+        return
+    end
 
-local left_hand_position_offset = Vector4f.new(-0.025, 0.045, 0.155, 0.0)
-local right_hand_position_offset = Vector4f.new(0.025, 0.045, 0.155, 0.0)
+    last_is_openxr = openxr_now
+    is_openxr = openxr_now
 
-if is_openxr then
-    left_hand_position_offset = openxr.left_hand_position_offset:clone()
-    right_hand_position_offset = openxr.right_hand_position_offset:clone()
+    local l_rot, r_rot, l_pos, r_pos = compute_hand_offsets(openxr_now)
+    left_hand_rotation_offset = l_rot
+    right_hand_rotation_offset = r_rot
+    left_hand_position_offset = l_pos
+    right_hand_position_offset = r_pos
+    re8vr.left_hand_rotation_offset = l_rot
+    re8vr.right_hand_rotation_offset = r_rot
+    re8vr.left_hand_position_offset = l_pos
+    re8vr.right_hand_position_offset = r_pos
 end
 
-re8vr.left_hand_rotation_offset = left_hand_rotation_offset
-re8vr.right_hand_rotation_offset = right_hand_rotation_offset
-re8vr.left_hand_position_offset = left_hand_position_offset
-re8vr.right_hand_position_offset = right_hand_position_offset
+-- Initial apply (may be corrected a few frames later if OpenXR state changes).
+sync_hand_offsets_if_needed(true)
 
 local ray_typedef = sdk.find_type_definition("via.Ray")
 local last_muzzle_rot = Quaternion.new(0.0, 0.0, 0.0, 0.0)
@@ -79,8 +107,6 @@ local motion_get_world_rotation = sdk.find_type_definition("via.motion.Motion"):
 local cast_ray_method = sdk.find_type_definition("via.physics.System"):get_method("castRay(via.physics.CastRayQuery, via.physics.CastRayResult)")
 local cast_ray_async_method = sdk.find_type_definition("via.physics.System"):get_method("castRayAsync(via.physics.CastRayQuery, via.physics.CastRayResult)")
 
-local via_mesh_type = sdk.typeof("via.render.Mesh")
-
 local cfg_path = "re7_vr/main_config.json"
 
 local queue_recenter = false
@@ -96,8 +122,6 @@ local last_book_open_time = 0.0
 local last_shop_open_time = 0.0
 local last_map_open_time = 0.0
 local last_scope_time = 0.0
--- When GUIScope was drawn more recently than this, we consider scope "active" (show weapon, etc.)
-local SCOPE_ACTIVE_THRESHOLD = 0.25
 local head_hash = nil
 
 local neg_forward_identity = Matrix4x4f.new(-1, 0, 0, 0,
@@ -111,9 +135,50 @@ local cfg = {
     disable_crosshair = false,
     no_melee_cooldown = false,
     roomscale_movement = true,
-    -- Keep weapon model visible while using telescopic sight (stops game from hiding it)
-    show_weapon_during_scope = true,
+
+    holster_enabled = true,
+    holster_show_stowed_weapons = true,
+    holster_disable_weapon_dial_dpad = true,
+    -- Extra offset per holster in meters along HMD axes: right (+ = your right), up (+ = above head), forward (+ = look direction).
+    holster_hmd_offset_m = {
+        left_shoulder = { right = 0, up = 0, forward = 0 },
+        left_chest = { right = 0, up = 0, forward = 0 },
+        left_waist = { right = 0, up = 0, forward = 0 },
+        right_waist = { right = 0, up = 0, forward = 0 },
+        right_shoulder = { right = 0, up = 0, forward = 0 },
+        medicine = { right = 0, up = 0, forward = 0 },
+    },
+    holster_weapon_hover_m = 0.24,
+    holster_medicine_inner_m = 0.16,
+    holster_medicine_blocks_weapon_m = 0.17,
+    holster_slots = {
+        left_shoulder = "",
+        left_chest = "",
+        left_waist = "",
+        right_waist = "",
+        right_shoulder = "",
+    },
+    -- Managed type name when owner GO name is empty (same keys as holster_slots).
+    holster_slot_types = {
+        left_shoulder = "",
+        left_chest = "",
+        left_waist = "",
+        right_waist = "",
+        right_shoulder = "",
+    },
 }
+
+local function strip_right_chest_weapon_slot_from_cfg()
+    if cfg.holster_slots ~= nil then
+        cfg.holster_slots.right_chest = nil
+    end
+    if cfg.holster_slot_types ~= nil then
+        cfg.holster_slot_types.right_chest = nil
+    end
+    if cfg.holster_hmd_offset_m ~= nil then
+        cfg.holster_hmd_offset_m.right_chest = nil
+    end
+end
 
 local function load_cfg()
     local loaded_cfg = json.load_file(cfg_path)
@@ -126,9 +191,166 @@ local function load_cfg()
     for k, v in pairs(loaded_cfg) do
         cfg[k] = v
     end
+    strip_right_chest_weapon_slot_from_cfg()
 end
 
 load_cfg()
+
+-- Native HolsterSlot indices (0–5 weapons, 6 = heal volume offset). Index 2 (RightChest) is not used for weapons.
+local holster_tune_slot_index = {
+    left_shoulder = 0,
+    left_chest = 1,
+    left_waist = 3,
+    right_waist = 4,
+    right_shoulder = 5,
+    medicine = 6,
+}
+
+local holster_tune_ui_rows = {
+    { "Left shoulder", "left_shoulder" },
+    { "Right shoulder", "right_shoulder" },
+    { "Left chest", "left_chest" },
+    { "Left waist", "left_waist" },
+    { "Right waist", "right_waist" },
+    { "Medicine (heal slot)", "medicine" },
+}
+
+local function ensure_holster_tune_defaults(c)
+    if c.holster_hmd_offset_m == nil or type(c.holster_hmd_offset_m) ~= "table" then
+        c.holster_hmd_offset_m = {}
+    end
+    for name in pairs(holster_tune_slot_index) do
+        local t = c.holster_hmd_offset_m[name]
+        if t == nil or type(t) ~= "table" then
+            c.holster_hmd_offset_m[name] = { right = 0, up = 0, forward = 0 }
+        else
+            t.right = tonumber(t.right) or 0
+            t.up = tonumber(t.up) or 0
+            t.forward = tonumber(t.forward) or 0
+        end
+    end
+    if c.holster_weapon_hover_m == nil then
+        c.holster_weapon_hover_m = 0.24
+    end
+    if c.holster_medicine_inner_m == nil then
+        c.holster_medicine_inner_m = 0.16
+    end
+    if c.holster_medicine_blocks_weapon_m == nil then
+        c.holster_medicine_blocks_weapon_m = 0.17
+    end
+end
+
+local function sync_holster_tune_to_re8vr()
+    if re8vr == nil or re8vr.set_holster_slot_offset == nil then
+        return
+    end
+    ensure_holster_tune_defaults(cfg)
+    for name, idx in pairs(holster_tune_slot_index) do
+        local t = cfg.holster_hmd_offset_m[name]
+        re8vr:set_holster_slot_offset(idx, t.right, t.up, t.forward)
+    end
+    re8vr:set_holster_slot_offset(2, 0, 0, 0)
+    re8vr:set_holster_tune_radii(
+        tonumber(cfg.holster_weapon_hover_m) or 0.24,
+        tonumber(cfg.holster_medicine_inner_m) or 0.16,
+        tonumber(cfg.holster_medicine_blocks_weapon_m) or 0.17
+    )
+end
+
+ensure_holster_tune_defaults(cfg)
+sync_holster_tune_to_re8vr()
+
+local holster_slot_to_index = {
+    left_shoulder = 0,
+    left_chest = 1,
+    left_waist = 3,
+    right_waist = 4,
+    right_shoulder = 5,
+}
+
+local holster_index_to_slot = {
+    [0] = "left_shoulder",
+    [1] = "left_chest",
+    [3] = "left_waist",
+    [4] = "right_waist",
+    [5] = "right_shoulder",
+}
+
+local holster_applied = false
+local last_holster_nonce = 0
+local last_holster_tune_nonce = 0
+
+-- json.load_file / dump_file use REFramework data dir: <persistent>/reframework/data/<cfg_path>
+local function reload_holster_slots_from_disk()
+    local disk = json.load_file(cfg_path)
+    if disk == nil or type(disk) ~= "table" then
+        return
+    end
+    if type(disk.holster_slots) == "table" then
+        cfg.holster_slots = disk.holster_slots
+    end
+    if type(disk.holster_slot_types) == "table" then
+        cfg.holster_slot_types = disk.holster_slot_types
+    end
+    if type(disk.holster_hmd_offset_m) == "table" then
+        cfg.holster_hmd_offset_m = disk.holster_hmd_offset_m
+    end
+    if disk.holster_weapon_hover_m ~= nil then
+        cfg.holster_weapon_hover_m = disk.holster_weapon_hover_m
+    end
+    if disk.holster_medicine_inner_m ~= nil then
+        cfg.holster_medicine_inner_m = disk.holster_medicine_inner_m
+    end
+    if disk.holster_medicine_blocks_weapon_m ~= nil then
+        cfg.holster_medicine_blocks_weapon_m = disk.holster_medicine_blocks_weapon_m
+    end
+    strip_right_chest_weapon_slot_from_cfg()
+    ensure_holster_tune_defaults(cfg)
+    sync_holster_tune_to_re8vr()
+end
+
+local function apply_holster_cfg()
+    if not cfg.holster_enabled then
+        holster_applied = true
+        return
+    end
+
+    if not re8vr or not re8vr.player or not re8vr.inventory or not re8vr.updater then
+        return
+    end
+
+    -- Always merge latest holster data from disk (Lua cfg can be stale vs file after new game process / external edit).
+    reload_holster_slots_from_disk()
+
+    if cfg.holster_slot_types == nil then
+        cfg.holster_slot_types = {}
+    end
+
+    for slot_name, idx in pairs(holster_slot_to_index) do
+        local weapon_id = cfg.holster_slots and cfg.holster_slots[slot_name] or ""
+        local type_id = cfg.holster_slot_types[slot_name] or ""
+        if weapon_id == nil then
+            weapon_id = ""
+        end
+        if type_id == nil then
+            type_id = ""
+        end
+        if weapon_id ~= "" or type_id ~= "" then
+            re8vr:set_holster_slot_persist(idx, weapon_id, type_id)
+        else
+            re8vr:clear_holster_assignment(idx)
+        end
+    end
+
+    if re8vr.clear_holster_assignment ~= nil then
+        re8vr:clear_holster_assignment(2)
+    end
+
+    ensure_holster_tune_defaults(cfg)
+    sync_holster_tune_to_re8vr()
+
+    holster_applied = true
+end
 
 statics.generate_global("via.hid.GamePadButton")
 statics.generate_global("via.hid.MouseButton")
@@ -347,23 +569,33 @@ local function update_pad_device(device)
     end
 
     -- gripping right joystick causes "left trigger" to be pressed (aiming)
+    -- RE7: suppress aim when no weapon is equipped, otherwise the game enters aim-mode and slows movement with empty hands.
     if vrmod:is_action_active(action_grip, right_joystick) then
-        cur_button = cur_button | via.hid.GamePadButton.LTrigBottom
-        device:call("set_AnalogL", 1.0)
+        local allow_aim = true
+        if is_re7 and (re8vr == nil or re8vr.weapon == nil) then
+            allow_aim = false
+        end
+
+        if allow_aim then
+            cur_button = cur_button | via.hid.GamePadButton.LTrigBottom
+            device:call("set_AnalogL", 1.0)
+        end
     end
 
     if vrmod:is_action_active(action_weapon_dial, left_joystick) or vrmod:is_action_active(action_weapon_dial, right_joystick) then
-        -- DPad mimickry
-        if vr_left_stick_axis.y >= 0.9 then
-            cur_button = cur_button | via.hid.GamePadButton.LUp
-        elseif vr_left_stick_axis.y <= -0.9 then
-            cur_button = cur_button | via.hid.GamePadButton.LDown
-        end
+        if not (cfg.holster_enabled and cfg.holster_disable_weapon_dial_dpad) then
+            -- DPad mimickry
+            if vr_left_stick_axis.y >= 0.9 then
+                cur_button = cur_button | via.hid.GamePadButton.LUp
+            elseif vr_left_stick_axis.y <= -0.9 then
+                cur_button = cur_button | via.hid.GamePadButton.LDown
+            end
 
-        if vr_left_stick_axis.x >= 0.9 then
-            cur_button = cur_button | via.hid.GamePadButton.LRight
-        elseif vr_left_stick_axis.x <= -0.9 then
-            cur_button = cur_button | via.hid.GamePadButton.LLeft
+            if vr_left_stick_axis.x >= 0.9 then
+                cur_button = cur_button | via.hid.GamePadButton.LRight
+            elseif vr_left_stick_axis.x <= -0.9 then
+                cur_button = cur_button | via.hid.GamePadButton.LLeft
+            end
         end
     else
         if vrmod:is_action_active(action_dpad_up, left_joystick) then
@@ -482,7 +714,6 @@ end
 
 -- RE8 only.
 local function on_pre_hid_padman_update(args)
-    last_padman_args = args
 
     local padman = sdk.to_managed_object(args[2])
 
@@ -499,7 +730,6 @@ local function on_pre_hid_padman_update(args)
 end
 
 local function on_post_hid_padman_update(retval)
-    local args = last_padman_args
 
     return retval
 end
@@ -733,20 +963,20 @@ local function on_post_throwable_late_update(retval)
     return retval
 end
 
-local bomb_args = nil
+local bomb_self = nil
 
 local function on_pre_bomb_activate_throwable(args)
     if not inside_throw then return end
 
-    bomb_args = args
+    bomb_self = args[2]
 end
 
 local function on_post_bomb_activate_throwable(retval)
-    if not inside_throw or bomb_args == nil then
+    if not inside_throw or bomb_self == nil then
         return retval
     end
 
-    local bomb = sdk.to_managed_object(bomb_args[2])
+    local bomb = sdk.to_managed_object(bomb_self)
     local physics_rigid_body = bomb:get_field("<rigidBodySet>k__BackingField")
 
     if physics_rigid_body == nil then
@@ -775,7 +1005,7 @@ local function on_post_bomb_activate_throwable(retval)
     rigid_body:call("setLinearVelocity", 0, right_velocity)
     rigid_body:call("setAngularVelocity", 0, rotation * right_angular_velocity)
 
-    bomb_args = nil
+    bomb_self = nil
     threw_bomb = true
 
     return retval
@@ -797,17 +1027,49 @@ local function on_pre_interact_manager_lateupdate(args)
         return
     end
 
-    local camera = sdk.get_primary_camera()
-    local camera_gameobject = component_get_gameobject:call(camera)
-    local camera_transform = gameobject_get_transform:call(camera_gameobject)
+    -- This hook is convenience-only; if anything fails, skip rather than erroring every frame.
+    local ok, err = pcall(function()
+        if last_camera_matrix == nil then
+            return
+        end
 
-    local joint = transform_get_joints:call(camera_transform)[0]
+        local camera = sdk.get_primary_camera()
+        if camera == nil then
+            return
+        end
 
-    old_camera_rot = joint_get_rotation:call(joint)
-    old_camera_pos = joint_get_position:call(joint)
+        if component_get_gameobject == nil or gameobject_get_transform == nil or transform_get_joints == nil then
+            return
+        end
 
-    joint_set_rotation:call(joint, last_camera_matrix:to_quat())
-    joint_set_position:call(joint, last_camera_matrix[3])
+        local camera_gameobject = component_get_gameobject:call(camera)
+        if camera_gameobject == nil then
+            return
+        end
+
+        local camera_transform = gameobject_get_transform:call(camera_gameobject)
+        if camera_transform == nil then
+            return
+        end
+
+        local joints = transform_get_joints:call(camera_transform)
+        local joint = joints ~= nil and joints[0] or nil
+        if joint == nil then
+            return
+        end
+
+        old_camera_rot = joint_get_rotation:call(joint)
+        old_camera_pos = joint_get_position:call(joint)
+
+        joint_set_rotation:call(joint, last_camera_matrix:to_quat())
+        joint_set_position:call(joint, last_camera_matrix[3])
+    end)
+
+    if not ok then
+        old_camera_rot = nil
+        old_camera_pos = nil
+        log.error("InteractManager pre-hook failed: " .. tostring(err))
+    end
 end
 
 local function on_post_interact_manager_lateupdate(retval)
@@ -815,14 +1077,47 @@ local function on_post_interact_manager_lateupdate(retval)
         return
     end
 
-    local camera = sdk.get_primary_camera()
-    local camera_gameobject = component_get_gameobject:call(camera)
-    local camera_transform = gameobject_get_transform:call(camera_gameobject)
+    local ok, err = pcall(function()
+        -- If the pre-hook failed or was skipped mid-frame, don't attempt to restore.
+        if old_camera_rot == nil or old_camera_pos == nil then
+            return
+        end
 
-    local joint = transform_get_joints:call(camera_transform)[0]
+        local camera = sdk.get_primary_camera()
+        if camera == nil then
+            return
+        end
 
-    joint_set_rotation:call(joint, old_camera_rot)
-    joint_set_position:call(joint, old_camera_pos)
+        if component_get_gameobject == nil or gameobject_get_transform == nil or transform_get_joints == nil then
+            return
+        end
+
+        local camera_gameobject = component_get_gameobject:call(camera)
+        if camera_gameobject == nil then
+            return
+        end
+
+        local camera_transform = gameobject_get_transform:call(camera_gameobject)
+        if camera_transform == nil then
+            return
+        end
+
+        local joints = transform_get_joints:call(camera_transform)
+        local joint = joints ~= nil and joints[0] or nil
+        if joint == nil then
+            return
+        end
+
+        joint_set_rotation:call(joint, old_camera_rot)
+        joint_set_position:call(joint, old_camera_pos)
+    end)
+
+    old_camera_rot = nil
+    old_camera_pos = nil
+
+    if not ok then
+        log.error("InteractManager post-hook failed: " .. tostring(err))
+    end
 
     return retval
 end
@@ -963,7 +1258,7 @@ local function update_crosshair_world_pos(start_pos, end_pos)
     end
 end
 
-local last_camera_update_args = nil
+local last_camera_update_self = nil
 local last_cutscene_state = false
 local last_time_not_maximum_controllable = 0.0
 local GUI_MAX_SLERP_TIME = 1.5
@@ -1369,7 +1664,7 @@ if is_re8 then
 end
 
 local function on_pre_player_camera_update(args)
-    last_camera_update_args = args
+    last_camera_update_self = args[2]
 
     if not vrmod:is_hmd_active() then
         return
@@ -1392,9 +1687,8 @@ local function on_pre_player_camera_update(args)
 end
 
 local function on_post_player_camera_update(retval)
-    local args = last_camera_update_args
 
-    local player_camera = sdk.to_managed_object(args[2])
+    local player_camera = sdk.to_managed_object(last_camera_update_self)
     fix_player_camera(player_camera)
 
     return retval
@@ -1466,10 +1760,9 @@ sdk.hook(
             return retval
         end
 
-        local args = last_camera_update_args
-        if args == nil then return retval end
+        if last_camera_update_self == nil then return retval end
 
-        local player_camera = sdk.to_managed_object(args[2])
+        local player_camera = sdk.to_managed_object(last_camera_update_self)
 
         local zero_quat = Quaternion.new(1, 0, 0, 0)
         local zero_vec = Vector3f.new(0, 0, 0)
@@ -1497,8 +1790,8 @@ local function on_pre_upper_vertical_update(args)
 
     --[[local upper_vertical = sdk.to_managed_object(args[2])
 
-    if not last_camera_update_args then return end
-    local player_camera = sdk.to_managed_object(last_camera_update_args[2])
+    if not last_camera_update_self then return end
+    local player_camera = sdk.to_managed_object(last_camera_update_self)
 
     local camera_rot = player_camera:get_field("<CameraRotation>k__BackingField")
     local camera_pos = player_camera:get_field("<CameraPosition>k__BackingField")
@@ -1535,13 +1828,109 @@ elseif is_re8 then
 end
 
 local function update_player_gestures()
-    re8vr:update_player_gestures()
+    if re8vr == nil or re8vr.update_player_gestures == nil then
+        return
+    end
+
+    local ok, err = pcall(function()
+        re8vr:update_player_gestures()
+    end)
+
+    if not ok then
+        log.error("update_player_gestures failed: " .. tostring(err))
+    end
 end
 
 local should_reset_view_no_player = false
 
 re.on_pre_application_entry("UpdateBehavior", function()
+    -- Keep pointers in sync even if this script's hook order changes relative to utility/RE8.lua.
+    if re8vr ~= nil and re8vr.update_pointers ~= nil then
+        re8vr:update_pointers()
+    end
+
+    -- While there is no player (title / loading), allow holster to be pushed from JSON again next time gameplay is active.
+    -- RE7 does not use `updater` the same way as RE8; gating on it breaks holster init.
+    local holster_player_ready = re8vr ~= nil and re8vr.player ~= nil and re8vr.inventory ~= nil
+    if not holster_player_ready then
+        holster_applied = false
+    end
+
+    -- Apply saved holsters before gestures so the first frame cannot overwrite an in-game assign with stale JSON.
+    if not holster_applied then
+        apply_holster_cfg()
+        if holster_applied then
+            last_holster_nonce = re8vr and re8vr.holster_assignment_nonce or 0
+            last_holster_tune_nonce = re8vr and re8vr.holster_tune_nonce or 0
+        end
+    end
+
+    if is_re8 and re8vr ~= nil and re8vr.holster_visualize_stowed_weapons ~= nil then
+        re8vr.holster_visualize_stowed_weapons = cfg.holster_enabled
+            and cfg.holster_show_stowed_weapons ~= false
+    end
+
     update_player_gestures()
+
+    if cfg.holster_enabled and re8vr and re8vr.holster_tune_nonce ~= nil and re8vr.get_holster_slot_hmd_offset_m ~= nil
+        and re8vr.holster_tune_nonce ~= last_holster_tune_nonce then
+        last_holster_tune_nonce = re8vr.holster_tune_nonce
+        local idx = re8vr.holster_tune_last_slot
+        if idx ~= nil then
+            local slot_name = holster_index_to_slot[idx]
+            if slot_name ~= nil then
+                local r, u, f = re8vr:get_holster_slot_hmd_offset_m(idx)
+                ensure_holster_tune_defaults(cfg)
+                cfg.holster_hmd_offset_m[slot_name] = { right = r, up = u, forward = f }
+                json.dump_file(cfg_path, cfg)
+                reframework:save_config()
+            end
+        end
+    end
+
+    if cfg.holster_enabled and re8vr and re8vr.holster_assignment_nonce ~= last_holster_nonce then
+        last_holster_nonce = re8vr.holster_assignment_nonce
+
+        if cfg.holster_slot_types == nil then
+            cfg.holster_slot_types = {}
+        end
+
+        -- Sync every weapon slot from native state (assign + clear-other-slots in one nonce bump).
+        local changed = false
+        for idx = 0, 5 do
+            local slot_name = holster_index_to_slot[idx]
+            if slot_name ~= nil then
+                -- Prefer the internal stable key for persistence so RE7 matching stays unambiguous (e.g. `wid:<id>`).
+                -- Fall back to display label if the native method isn't present.
+                local weapon_id = ""
+                if re8vr.get_holster_assignment_key ~= nil then
+                    weapon_id = re8vr:get_holster_assignment_key(idx)
+                else
+                    weapon_id = re8vr:get_holster_assignment(idx)
+                end
+                local type_id = re8vr:get_holster_type_assignment(idx)
+                if weapon_id == nil then
+                    weapon_id = ""
+                end
+                if type_id == nil then
+                    type_id = ""
+                end
+                if cfg.holster_slots[slot_name] ~= weapon_id then
+                    cfg.holster_slots[slot_name] = weapon_id
+                    changed = true
+                end
+                if cfg.holster_slot_types[slot_name] ~= type_id then
+                    cfg.holster_slot_types[slot_name] = type_id
+                    changed = true
+                end
+            end
+        end
+        if changed then
+            -- Must write the same file load_cfg() reads (re7_vr/main_config.json). save_config alone can defer or omit script cfg.
+            json.dump_file(cfg_path, cfg)
+            reframework:save_config()
+        end
+    end
 
     if not re8vr.player then
         if should_reset_view_no_player then
@@ -1793,17 +2182,17 @@ local function melee_attack(hit_controller)
     end
 end
 
-local hit_controller_args = nil
+local hit_controller_self = nil
 
 local function on_pre_hit_controller_update(args)
-    hit_controller_args = args
+    hit_controller_self = args[2]
 end
 
 local function on_post_hit_controller_update(args)
     if not vrmod:is_hmd_active() or not vrmod:is_using_controllers() then return end
     if re8vr.is_in_cutscene or not re8vr.can_use_hands then return end
 
-    local hit_controller = sdk.to_managed_object(hit_controller_args[2])
+    local hit_controller = sdk.to_managed_object(hit_controller_self)
 
     melee_attack(hit_controller)
 end
@@ -1836,38 +2225,9 @@ re.on_application_entry("LockScene", function()
 
     update_muzzle_data()
 
-    -- Scope active = GUIScope was drawn recently (telescopic sight in use)
-    local scope_active = (os.clock() - last_scope_time) < SCOPE_ACTIVE_THRESHOLD
-    _G.vr_scope_active = scope_active
-
     if re8vr.last_shoot_pos then
         local pos = re8vr.last_shoot_pos + (re8vr.last_shoot_dir * 0.02)
         update_crosshair_world_pos(pos, pos + (re8vr.last_shoot_dir * 1000.0))
-    end
-
-    -- When using telescopic sight: keep weapon model visible (game often hides it) and optionally reparent
-    if scope_active and cfg.show_weapon_during_scope and re8vr.weapon and re8vr.transform then
-        local weapon_go = nil
-        if is_re7 then
-            weapon_go = re8vr.weapon:call("get_GameObject")
-        elseif is_re8 then
-            weapon_go = re8vr.weapon:get_field("<owner>k__BackingField")
-        end
-        if weapon_go and tostring(weapon_go) ~= "nil" then
-            local wp_tf = weapon_go:call("get_Transform")
-            if wp_tf then
-                local ok, parent = pcall(function() return wp_tf:call("get_Parent") end)
-                if not ok or not parent or tostring(parent) == "nil" then
-                    pcall(function() wp_tf:call("set_Parent", re8vr.transform) end)
-                end
-            end
-            if via_mesh_type then
-                local mesh = weapon_go:call("getComponent(System.Type)", via_mesh_type)
-                if mesh and tostring(mesh) ~= "nil" then
-                    pcall(function() mesh:call("setPartsEnable", 0, true) end)
-                end
-            end
-        end
     end
     
     --[[if not vrmod:is_hmd_active() then return end
@@ -2192,6 +2552,10 @@ end
 local cached_contact_pos = nil
 
 re.on_frame(function()
+    -- Startup robustness: OpenXR can become "loaded" a short time after script init.
+    -- Re-apply hand offsets automatically (removes need to "Reset scripts" in RE7).
+    sync_hand_offsets_if_needed(false)
+
     if cached_contact_pos then
         local screen = draw.world_to_screen(cached_contact_pos)
 
@@ -2228,7 +2592,6 @@ re.on_draw_ui(function()
     changed, cfg.movement_shake = imgui.checkbox("Movement Shake", cfg.movement_shake)
     changed, cfg.all_camera_shake = imgui.checkbox("All Other Camera Shakes", cfg.all_camera_shake)
     changed, cfg.disable_crosshair = imgui.checkbox("Disable Crosshair", cfg.disable_crosshair)
-    changed, cfg.show_weapon_during_scope = imgui.checkbox("Show weapon during scope (telescopic sight)", cfg.show_weapon_during_scope)
     changed, cfg.roomscale_movement = imgui.checkbox("Roomscale Movement", cfg.roomscale_movement)
 
     if imgui.tree_node("Cheats") then
@@ -2241,32 +2604,133 @@ re.on_draw_ui(function()
 
     if changed then
         left_hand_rotation_offset = Quaternion.new(left_hand_rotation_vec):normalized()
+        re8vr.left_hand_rotation_offset = left_hand_rotation_offset
     end
 
     changed, right_hand_rotation_vec = imgui.drag_float3("Right Hand Rotation Offset", right_hand_rotation_vec, 0.005, -5.0, 5.0)
 
     if changed then
         right_hand_rotation_offset = Quaternion.new(right_hand_rotation_vec):normalized()
+        re8vr.right_hand_rotation_offset = right_hand_rotation_offset
     end
 
-    changed, left_hand_position_offset = imgui.drag_float4("Left Hand Position Offset", left_hand_position_offset, 0.005, -5.0, 5.0)
-    changed, right_hand_position_offset = imgui.drag_float4("Right Hand Position Offset", right_hand_position_offset, 0.005, -5.0, 5.0)
+    -- Some imgui builds throw when passing Vector4f to drag_float4; keep this as XYZ only (W is always 0 for offsets).
+    local lpos3 = Vector3f.new(left_hand_position_offset.x, left_hand_position_offset.y, left_hand_position_offset.z)
+    local rpos3 = Vector3f.new(right_hand_position_offset.x, right_hand_position_offset.y, right_hand_position_offset.z)
+    local lpos_changed, lpos_nv = imgui.drag_float3("Left Hand Position Offset (xyz)", lpos3, 0.005, -5.0, 5.0)
+    local rpos_changed, rpos_nv = imgui.drag_float3("Right Hand Position Offset (xyz)", rpos3, 0.005, -5.0, 5.0)
+    if lpos_changed then
+        left_hand_position_offset = Vector4f.new(lpos_nv.x, lpos_nv.y, lpos_nv.z, 0.0)
+        re8vr.left_hand_position_offset = left_hand_position_offset
+        changed = true
+    end
+    if rpos_changed then
+        right_hand_position_offset = Vector4f.new(rpos_nv.x, rpos_nv.y, rpos_nv.z, 0.0)
+        re8vr.right_hand_position_offset = right_hand_position_offset
+        changed = true
+    end
+
+    if imgui.tree_node("Holster slot positions (HMD)") then
+        ensure_holster_tune_defaults(cfg)
+        imgui.text("Offsets in meters: X = head right, Y = head up, Z = head forward. Written to main_config.json when you change a value.")
+        imgui.text("In-game: hover an assigned slot with the right hand, hold left grip — the slot follows your right hand (soft pulse on right controller). Release left grip to save.")
+        imgui.separator()
+        imgui.text("Current holster assignments (native -> JSON sync)")
+        if re8vr ~= nil then
+            for idx = 0, 5 do
+                if idx ~= 2 then
+                    local slot_name = holster_index_to_slot[idx] or ("slot_" .. tostring(idx))
+                    local wid = ""
+                    local tid = ""
+                    local item_data_id = ""
+                    if re8vr.get_holster_assignment ~= nil then
+                        wid = re8vr:get_holster_assignment(idx) or ""
+                    end
+                    if re8vr.get_holster_type_assignment ~= nil then
+                        tid = re8vr:get_holster_type_assignment(idx) or ""
+                    end
+                    if re8vr.re7_get_holster_item_data_id ~= nil then
+                        item_data_id = re8vr:re7_get_holster_item_data_id(idx) or ""
+                    end
+                    if item_data_id ~= "" then
+                        imgui.text(string.format("%s: %s  (%s)  itemDataID=%s", slot_name, wid, tid, item_data_id))
+                    else
+                        imgui.text(string.format("%s: %s  (%s)", slot_name, wid, tid))
+                    end
+                end
+            end
+            imgui.text("(Native slot 2 / right chest is unused — medicine uses the heal volume nearby.)")
+        else
+            imgui.text("re8vr not available")
+        end
+        imgui.separator()
+
+        local ht_changed = false
+        for _, row in ipairs(holster_tune_ui_rows) do
+            local label = row[1]
+            local name = row[2]
+            local off = cfg.holster_hmd_offset_m[name]
+            local v = Vector3f.new(off.right, off.up, off.forward)
+            local ch, nv = imgui.drag_float3(label, v, 0.001, -0.5, 0.5)
+            if ch then
+                off.right = nv.x
+                off.up = nv.y
+                off.forward = nv.z
+                ht_changed = true
+            end
+        end
+        local c2, hover_m = imgui.drag_float("Weapon slot hover radius (m)", cfg.holster_weapon_hover_m, 0.005, 0.05, 0.8)
+        if c2 then
+            cfg.holster_weapon_hover_m = hover_m
+            ht_changed = true
+        end
+        local c3, inner_m = imgui.drag_float("Medicine grip radius (m)", cfg.holster_medicine_inner_m, 0.005, 0.05, 0.5)
+        if c3 then
+            cfg.holster_medicine_inner_m = inner_m
+            ht_changed = true
+        end
+        local c4, block_m = imgui.drag_float("Medicine blocks weapon holster (m)", cfg.holster_medicine_blocks_weapon_m, 0.005, 0.05, 0.5)
+        if c4 then
+            cfg.holster_medicine_blocks_weapon_m = block_m
+            ht_changed = true
+        end
+        if imgui.button("Reset holster offsets to 0") then
+            for name in pairs(holster_tune_slot_index) do
+                cfg.holster_hmd_offset_m[name] = { right = 0, up = 0, forward = 0 }
+            end
+            ht_changed = true
+        end
+        imgui.same_line()
+        if imgui.button("Reset holster radii to defaults") then
+            cfg.holster_weapon_hover_m = 0.24
+            cfg.holster_medicine_inner_m = 0.16
+            cfg.holster_medicine_blocks_weapon_m = 0.17
+            ht_changed = true
+        end
+        if ht_changed then
+            sync_holster_tune_to_re8vr()
+            json.dump_file(cfg_path, cfg)
+        end
+        imgui.tree_pop()
+    end
+
+    do
+        local show_stowed = cfg.holster_show_stowed_weapons ~= false
+        local ch_stowed
+        ch_stowed, show_stowed = imgui.checkbox(
+            "Show stowed weapons on holster slots (mesh at belt/chest)",
+            show_stowed
+        )
+        if ch_stowed then
+            cfg.holster_show_stowed_weapons = show_stowed
+            changed = true
+            json.dump_file(cfg_path, cfg)
+        end
+    end
 
     if imgui.tree_node("Debug") then
         changed, debug_adjust_hand_offset = imgui.checkbox("Adjust Hand Offset", debug_adjust_hand_offset)
         changed, debug_hands = imgui.checkbox("Debug Hands", debug_hands)
-        -- Show current weapon GameObject name (RE8/RE7: e.g. "ri3042_Inventory"; RE4: numeric ID)
-        if re8vr.weapon then
-            local weapon_go = is_re8 and re8vr.weapon:get_field("<owner>k__BackingField") or (is_re7 and re8vr.weapon:call("get_GameObject"))
-            local name_str = "?"
-            if weapon_go and tostring(weapon_go) ~= "nil" then
-                local ok, name = pcall(function() return weapon_go:call("get_Name") end)
-                if ok and name then name_str = name end
-            end
-            imgui.text("Current weapon GameObject: " .. tostring(name_str))
-        else
-            imgui.text("Current weapon GameObject: (none)")
-        end
 
         if debug_adjust_hand_offset then
             local left_axis = vrmod:get_left_stick_axis()
@@ -2582,10 +3046,6 @@ local scope_names = {
 for i, v in ipairs(scope_names) do
     scope_names[v] = true
 end
-
--- RE8/RE7 weapon IDs: the game uses GameObject names like "ri3042_Inventory" for weapons in the scene.
--- To verify: equip the weapon, open REFramework menu → Debug and check "Current weapon GameObject".
--- RE4 uses numeric IDs (e.g. 4202) from get_EquipWeaponID instead.
 
 local shop_names = {
     "GUIShopBg",
