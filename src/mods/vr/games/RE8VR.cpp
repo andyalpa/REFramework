@@ -1,6 +1,9 @@
 #if defined(RE7) || defined(RE8)
-#include <cstdlib>
+#include <algorithm>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sdk/SceneManager.hpp>
 #include <sdk/MurmurHash.hpp>
@@ -110,6 +113,25 @@ void RE8VR::on_lua_state_created(sol::state& lua) {
         "wants_heal", &RE8VR::m_wants_heal,
         "delta_time", &RE8VR::m_delta_time,
         "movement_speed_rate", &RE8VR::m_movement_speed_rate,
+        "holster_assignment_nonce", &RE8VR::m_holster_assignment_nonce,
+        "holster_tune_nonce", &RE8VR::m_holster_tune_nonce,
+        "holster_tune_last_slot", &RE8VR::m_holster_tune_last_slot,
+        "holster_last_assigned_slot", &RE8VR::m_holster_last_assigned_slot,
+        "holster_last_assigned_weapon_id", &RE8VR::m_holster_last_assigned_weapon_id,
+        "get_recoil_enabled", &RE8VR::get_recoil_enabled,
+        "set_recoil_enabled", &RE8VR::set_recoil_enabled,
+        "get_recoil_intensity", &RE8VR::get_recoil_intensity,
+        "set_recoil_intensity", &RE8VR::set_recoil_intensity,
+        "get_recoil_attack_duration", &RE8VR::get_recoil_attack_duration,
+        "set_recoil_attack_duration", &RE8VR::set_recoil_attack_duration,
+        "get_recoil_spring_stiffness", &RE8VR::get_recoil_spring_stiffness,
+        "set_recoil_spring_stiffness", &RE8VR::set_recoil_spring_stiffness,
+        "get_recoil_spring_damping", &RE8VR::get_recoil_spring_damping,
+        "set_recoil_spring_damping", &RE8VR::set_recoil_spring_damping,
+        "get_recoil_sustained_damping", &RE8VR::get_recoil_sustained_damping,
+        "set_recoil_sustained_damping", &RE8VR::set_recoil_sustained_damping,
+        "get_recoil_sustained_window", &RE8VR::get_recoil_sustained_window,
+        "set_recoil_sustained_window", &RE8VR::set_recoil_sustained_window,
         "set_hand_joints_to_tpose", &RE8VR::set_hand_joints_to_tpose,
         "update_hand_ik", &RE8VR::update_hand_ik,
         "update_body_ik", &RE8VR::update_body_ik,
@@ -120,8 +142,20 @@ void RE8VR::on_lua_state_created(sol::state& lua) {
         "fix_player_shadow", &RE8VR::fix_player_shadow,
         "get_localplayer", &RE8VR::get_localplayer,
         "get_weapon_object", &RE8VR::get_weapon_object,
+        "set_holster_assignment", &RE8VR::set_holster_assignment,
+        "set_holster_slot_persist", &RE8VR::set_holster_slot_persist,
+        "clear_holster_assignment", &RE8VR::clear_holster_assignment,
+        "get_holster_assignment", &RE8VR::get_holster_assignment,
+        "get_holster_type_assignment", &RE8VR::get_holster_type_assignment,
+        "set_holster_slot_offset", &RE8VR::set_holster_slot_offset,
+        "set_holster_tune_radii", &RE8VR::set_holster_tune_radii,
+        "get_holster_slot_hmd_offset_m", &RE8VR::get_holster_slot_hmd_offset_m,
         "get_weapon_recoil_id", &RE8VR::get_weapon_recoil_id,
         "get_current_weapon_recoil_id", &RE8VR::get_current_weapon_recoil_id,
+        "set_per_weapon_recoil_one_hand", &RE8VR::set_per_weapon_recoil_one_hand,
+        "get_per_weapon_recoil_one_hand", &RE8VR::get_per_weapon_recoil_one_hand,
+        "set_per_weapon_recoil_two_hands", &RE8VR::set_per_weapon_recoil_two_hands,
+        "get_per_weapon_recoil_two_hands", &RE8VR::get_per_weapon_recoil_two_hands,
         "set_per_weapon_recoil_intensity", &RE8VR::set_per_weapon_recoil_intensity,
         "get_per_weapon_recoil_intensity", &RE8VR::get_per_weapon_recoil_intensity,
         "load_recoil_settings", &RE8VR::load_recoil_settings,
@@ -133,6 +167,186 @@ void RE8VR::on_lua_state_created(sol::state& lua) {
 void RE8VR::on_lua_state_destroyed(sol::state& lua) {
     
 }
+
+namespace {
+
+bool holster_saved_id_is_inventory_bucket(const std::string& id) {
+    return !id.empty() && id.find("Inventory") != std::string::npos;
+}
+
+std::string holster_try_item_numeric_key(::REManagedObject* obj) {
+    if (obj == nullptr) {
+        return {};
+    }
+
+    static const char* const k_method_names[] = {
+        "get_ItemId",
+        "get_ItemID",
+        "get_itemId",
+        "get_ContextId",
+    };
+
+    for (const auto* mn : k_method_names) {
+        try {
+            const auto id = sdk::call_object_func_easy<int32_t>(obj, mn);
+            if (id != 0) {
+                return std::string("item:") + std::to_string(id);
+            }
+        } catch (...) {
+        }
+    }
+
+    static const char* const k_field_names[] = {
+        "<ItemId>k__BackingField",
+        "<itemId>k__BackingField",
+        "_ItemId",
+        "_itemId",
+        "ItemId",
+    };
+
+    for (const auto* fn : k_field_names) {
+        try {
+            const auto* p = sdk::get_object_field<int32_t>(obj, fn);
+            if (p != nullptr && *p != 0) {
+                return std::string("item:") + std::to_string(*p);
+            }
+        } catch (...) {
+        }
+    }
+
+    return {};
+}
+
+std::string holster_weapon_instance_key(::REManagedObject* item) {
+    if (item == nullptr) {
+        return {};
+    }
+
+    try {
+        if (auto* go = sdk::call_object_func_easy<::REGameObject*>(item, "get_GameObject"); go != nullptr) {
+            auto n = utility::re_game_object::get_name(go);
+            if (n.empty()) {
+                n = utility::re_string::get_string(go->name);
+            }
+            if (!n.empty()) {
+                return n;
+            }
+        }
+    } catch (...) {
+    }
+
+    if (auto nested = holster_try_item_numeric_key(item); !nested.empty()) {
+        return nested;
+    }
+
+    try {
+        if (auto* inner = sdk::get_object_field<::REManagedObject*>(item, "Item"); inner != nullptr && *inner != nullptr) {
+            if (auto nested = holster_try_item_numeric_key(*inner); !nested.empty()) {
+                return nested;
+            }
+        }
+    } catch (...) {
+    }
+
+    auto owner = *sdk::get_object_field<::REGameObject*>(item, "<owner>k__BackingField");
+    if (owner != nullptr) {
+        const auto on = utility::re_string::get_string(owner->name);
+        if (!holster_saved_id_is_inventory_bucket(on)) {
+            return on;
+        }
+    }
+
+    char buf[48]{};
+    (void)std::snprintf(buf, sizeof(buf), "reobj:%" PRIxPTR, reinterpret_cast<uintptr_t>(item));
+    return buf;
+}
+
+std::string holster_weapon_go_name_only(::REManagedObject* item) {
+    if (item == nullptr) {
+        return {};
+    }
+
+    try {
+        if (auto* go = sdk::call_object_func_easy<::REGameObject*>(item, "get_GameObject"); go != nullptr) {
+            auto n = utility::re_game_object::get_name(go);
+            if (n.empty()) {
+                n = utility::re_string::get_string(go->name);
+            }
+            return n;
+        }
+    } catch (...) {
+    }
+
+    return {};
+}
+
+std::string holster_weapon_json_label(::REManagedObject* item, const std::string& match_key) {
+    if (item == nullptr) {
+        return match_key;
+    }
+
+    const auto go_name = holster_weapon_go_name_only(item);
+    if (!go_name.empty()) {
+        return go_name;
+    }
+
+    if (match_key.size() >= 5 && match_key.compare(0, 5, "item:") == 0) {
+        return match_key;
+    }
+
+    auto owner = *sdk::get_object_field<::REGameObject*>(item, "<owner>k__BackingField");
+    if (owner != nullptr) {
+        const auto on = utility::re_string::get_string(owner->name);
+        if (!on.empty()) {
+            return on;
+        }
+    }
+
+    return match_key;
+}
+
+std::string holster_match_key_from_saved_weapon_id(const std::string& saved_id) {
+    if (saved_id.size() >= 6 && saved_id.compare(0, 6, "reobj:") == 0) {
+        return saved_id;
+    }
+
+    if (saved_id.size() >= 5 && saved_id.compare(0, 5, "item:") == 0) {
+        return saved_id;
+    }
+
+    if (holster_saved_id_is_inventory_bucket(saved_id)) {
+        return {};
+    }
+
+    return saved_id;
+}
+
+bool holster_item_matches_slot_assignment(const std::string& item_key, const std::string& owner_name,
+    const std::string& item_type_name, const std::string& assigned_id, const std::string& assigned_type_id) {
+    if (assigned_id.empty() && assigned_type_id.empty()) {
+        return false;
+    }
+
+    if (!assigned_type_id.empty() && item_type_name != assigned_type_id) {
+        return false;
+    }
+
+    if (assigned_id.empty()) {
+        return true;
+    }
+
+    if (holster_saved_id_is_inventory_bucket(assigned_id)) {
+        return true;
+    }
+
+    if (!item_key.empty() && item_key == assigned_id) {
+        return true;
+    }
+
+    return owner_name == assigned_id;
+}
+
+} // namespace
 
 void RE8VR::on_draw_ui() {
     ImGui::SetNextItemOpen(false, ImGuiCond_::ImGuiCond_FirstUseEver);
@@ -462,17 +676,11 @@ void RE8VR::update_hand_ik() {
         lh_pos.w = 1.0f;
         lh_rotation = glm::normalize(rh_rotation * original_left_rot_relative);
     } else {
-        if (*m_recoil_enabled) {
-            const auto recoil_pos = get_recoil_position_offset_world(original_camera_rotation);
-            const auto recoil_rot = get_recoil_rotation_offset_world(original_camera_rotation);
-            lh_pos += Vector4f(recoil_pos, 0.0f);
-            lh_rotation = glm::normalize(recoil_rot * lh_rotation);
-        }
+        // One-handed aiming: only the weapon hand recoils.
     }
 
     m_last_left_hand_position = lh_pos;
-    m_last_left_hand_rotation = lh_rotation;
-    m_last_left_hand_rotation.w = 1.0f;
+    m_last_left_hand_rotation = glm::normalize(lh_rotation);
 
     set_hand_joints_to_tpose(m_left_hand_ik);
 
@@ -489,8 +697,7 @@ void RE8VR::update_hand_ik() {
     sdk::call_object_func_easy<void*>(m_right_hand_ik, "calc");
 
     m_last_right_hand_position = rh_pos;
-    m_last_right_hand_rotation = rh_rotation;
-    m_last_right_hand_rotation.w = 1.0f;
+    m_last_right_hand_rotation = glm::normalize(rh_rotation);
 
     if (head_joint != nullptr && original_head_rotation) {
         sdk::set_joint_rotation(head_joint, *original_head_rotation);
@@ -593,7 +800,11 @@ void RE8VR::update_player_gestures() {
         m_wants_heal = false;
         m_heal_gesture.was_grip_down = false;
         m_heal_gesture.was_trigger_down = false;
-        
+        m_heal_gesture.raw_was_grip_down = false;
+        m_heal_gesture.heal_grip_began_inside_slot = false;
+        m_weapon_holster.was_grip_down = false;
+        m_weapon_holster.holster_grip_ever_outside_slots = false;
+
         return;
     }
 
@@ -610,7 +821,156 @@ void RE8VR::update_player_gestures() {
     m_hmd_dir_to_right = glm::normalize(m_hmd_delta_to_right);
 
     update_block_gesture();
+    update_weapon_holster_gesture();
     update_heal_gesture();
+}
+
+void RE8VR::set_holster_assignment(int slot, const std::string& weapon_id) {
+    if (slot < 0 || slot >= static_cast<int>(m_weapon_holster.slot_weapon_id.size())) {
+        return;
+    }
+
+    if (slot == static_cast<int>(HolsterSlot::RightChest)) {
+        clear_holster_assignment(slot);
+        return;
+    }
+
+    if (slot == static_cast<int>(HolsterSlot::RightShoulderHeal)) {
+        return;
+    }
+
+    m_weapon_holster.slot_weapon_json_label[slot] = weapon_id;
+    m_weapon_holster.slot_weapon_id[slot] = holster_match_key_from_saved_weapon_id(weapon_id);
+    m_weapon_holster.slot_weapon_type_id[slot].clear();
+}
+
+void RE8VR::set_holster_slot_persist(int slot, const std::string& weapon_id, const std::string& type_id) {
+    if (slot < 0 || slot >= static_cast<int>(m_weapon_holster.slot_weapon_id.size())) {
+        return;
+    }
+
+    if (slot == static_cast<int>(HolsterSlot::RightChest)) {
+        clear_holster_assignment(slot);
+        return;
+    }
+
+    if (slot == static_cast<int>(HolsterSlot::RightShoulderHeal)) {
+        return;
+    }
+
+    m_weapon_holster.slot_weapon_json_label[slot] = weapon_id;
+    m_weapon_holster.slot_weapon_id[slot] = holster_match_key_from_saved_weapon_id(weapon_id);
+    m_weapon_holster.slot_weapon_type_id[slot] = type_id;
+}
+
+void RE8VR::clear_holster_assignment(int slot) {
+    if (slot < 0 || slot >= static_cast<int>(m_weapon_holster.slot_weapon_id.size())) {
+        return;
+    }
+
+    if (slot == static_cast<int>(HolsterSlot::RightShoulderHeal)) {
+        return;
+    }
+
+    m_weapon_holster.slot_weapon_id[slot].clear();
+    m_weapon_holster.slot_weapon_json_label[slot].clear();
+    m_weapon_holster.slot_weapon_type_id[slot].clear();
+}
+
+std::string RE8VR::get_holster_assignment(int slot) const {
+    if (slot < 0 || slot >= static_cast<int>(m_weapon_holster.slot_weapon_json_label.size())) {
+        return {};
+    }
+
+    return m_weapon_holster.slot_weapon_json_label[slot];
+}
+
+std::string RE8VR::get_holster_type_assignment(int slot) const {
+    if (slot < 0 || slot >= static_cast<int>(m_weapon_holster.slot_weapon_type_id.size())) {
+        return {};
+    }
+
+    return m_weapon_holster.slot_weapon_type_id[slot];
+}
+
+void RE8VR::set_holster_slot_offset(int slot, float right_m, float up_m, float forward_m) {
+    if (slot < 0 || slot >= static_cast<int>(m_holster_hmd_offset_m.size())) {
+        return;
+    }
+
+    m_holster_hmd_offset_m[static_cast<size_t>(slot)] = Vector3f{right_m, up_m, forward_m};
+}
+
+void RE8VR::set_holster_tune_radii(float weapon_hover_m, float heal_inner_m, float heal_blocks_weapon_m) {
+    m_holster_weapon_hover_m = std::clamp(weapon_hover_m, 0.05f, 0.80f);
+    m_holster_heal_inner_m = std::clamp(heal_inner_m, 0.05f, 0.50f);
+    m_holster_heal_blocks_weapon_m = std::clamp(heal_blocks_weapon_m, 0.05f, 0.50f);
+}
+
+std::tuple<float, float, float> RE8VR::get_holster_slot_hmd_offset_m(int slot) const {
+    if (slot < 0 || slot >= static_cast<int>(m_holster_hmd_offset_m.size())) {
+        return {0.f, 0.f, 0.f};
+    }
+
+    const auto& v = m_holster_hmd_offset_m[static_cast<size_t>(slot)];
+    return {v.x, v.y, v.z};
+}
+
+Vector3f RE8VR::compute_holster_slot_base_world_position(const RE8VR::HolsterSlot holster_slot, const Vector3f& head_pos,
+    const Vector3f& head_right, const Vector3f& head_up, const Vector3f& head_forward) const {
+    switch (holster_slot) {
+    case HolsterSlot::LeftShoulder:
+        return head_pos + (head_right * -0.34f) + (head_up * -0.04f) + (head_forward * 0.10f);
+    case HolsterSlot::LeftChest:
+        return head_pos + (head_right * -0.18f) + (head_up * -0.20f) + (head_forward * -0.18f);
+    case HolsterSlot::RightChest:
+        return head_pos + (head_right * 0.22f) + (head_up * -0.36f) + (head_forward * -0.08f);
+    case HolsterSlot::LeftWaist:
+        return head_pos + (head_right * -0.28f) + (head_up * -0.48f) + (head_forward * -0.06f);
+    case HolsterSlot::RightWaist:
+        return head_pos + (head_right * 0.28f) + (head_up * -0.48f) + (head_forward * -0.06f);
+    case HolsterSlot::RightShoulder:
+        return head_pos + (head_right * 0.34f) + (head_up * -0.04f) + (head_forward * 0.10f);
+    case HolsterSlot::RightShoulderHeal:
+        return head_pos + (head_right * 0.18f) + (head_up * -0.20f) + (head_forward * -0.18f);
+    default:
+        return head_pos;
+    }
+}
+
+Vector3f RE8VR::compute_holster_slot_world_position(const RE8VR::HolsterSlot holster_slot, const Vector3f& head_pos,
+    const Vector3f& head_right, const Vector3f& head_up, const Vector3f& head_forward) const {
+    const Vector3f base = compute_holster_slot_base_world_position(holster_slot, head_pos, head_right, head_up, head_forward);
+    const auto& u = m_holster_hmd_offset_m[static_cast<size_t>(holster_slot)];
+    return base + head_right * u.x + head_up * u.y + head_forward * u.z;
+}
+
+void RE8VR::holster_clear_weapon_from_other_slots(const std::string& instance_key, const std::string& type_id, int except_slot) {
+    static constexpr int k_holster_weapon_slot_count = 6;
+
+    for (int i = 0; i < k_holster_weapon_slot_count; ++i) {
+        if (i == except_slot) {
+            continue;
+        }
+
+        const auto ui = static_cast<size_t>(i);
+        const auto& sid = m_weapon_holster.slot_weapon_id[ui];
+        const auto& stype = m_weapon_holster.slot_weapon_type_id[ui];
+
+        bool clear_slot = false;
+        if (!instance_key.empty() && sid == instance_key) {
+            clear_slot = true;
+        }
+
+        if (!clear_slot && !type_id.empty() && stype == type_id && holster_saved_id_is_inventory_bucket(sid)
+            && holster_saved_id_is_inventory_bucket(instance_key)) {
+            clear_slot = true;
+        }
+
+        if (clear_slot) {
+            clear_holster_assignment(i);
+        }
+    }
 }
 
 void RE8VR::fix_player_camera(::REManagedObject* player_camera) {
@@ -1471,6 +1831,703 @@ void RE8VR::update_block_gesture() {
     m_wants_block = left_hand_up && right_hand_up;
 }
 
+void RE8VR::update_weapon_holster_gesture() {
+ #ifdef RE8
+    if (m_player == nullptr || m_inventory == nullptr || m_updater == nullptr) {
+ #else
+    // RE7: m_updater can be null; weapon_change/equip_manager are resolved via components below.
+    if (m_player == nullptr || m_inventory == nullptr) {
+ #endif
+        m_weapon_holster.was_grip_down = false;
+        m_weapon_holster.holster_grip_ever_outside_slots = false;
+        m_weapon_holster.was_left_grip_for_holster_tune = false;
+        m_weapon_holster.holster_tune_drag_slot = -1;
+        return;
+    }
+
+    if (m_is_in_cutscene || !m_can_use_hands || m_is_grapple_aim || m_has_vehicle || m_is_reloading) {
+        m_weapon_holster.was_grip_down = false;
+        m_weapon_holster.holster_grip_ever_outside_slots = false;
+        m_weapon_holster.was_left_grip_for_holster_tune = false;
+        m_weapon_holster.holster_tune_drag_slot = -1;
+        return;
+    }
+
+    auto& vr = VR::get();
+    if (!vr->is_using_controllers()) {
+        m_weapon_holster.was_grip_down = false;
+        m_weapon_holster.holster_grip_ever_outside_slots = false;
+        m_weapon_holster.was_left_grip_for_holster_tune = false;
+        m_weapon_holster.holster_tune_drag_slot = -1;
+        return;
+    }
+
+    const auto right_joystick = vr->get_right_joystick();
+    const auto left_joystick = vr->get_left_joystick();
+    const auto action_grip = vr->get_action_grip();
+    const auto is_grip_down = vr->is_action_active(action_grip, right_joystick);
+    const bool is_left_grip_down = vr->is_action_active(action_grip, left_joystick);
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto hmd = vr->get_transform(0);
+    const auto right_hand = vr->get_transform(vr->get_controllers()[1]);
+
+    const Vector3f head_pos{hmd[3]};
+    const Vector3f head_right{hmd[0]};
+    const Vector3f head_up{hmd[1]};
+    const Vector3f head_forward{hmd[2]};
+    const Vector3f rh_pos{right_hand[3]};
+    const Vector3f heal_slot_pos =
+        compute_holster_slot_world_position(HolsterSlot::RightShoulderHeal, head_pos, head_right, head_up, head_forward);
+    const float hover_r = m_holster_weapon_hover_m;
+    const float hand_h = glm::dot(rh_pos - head_pos, head_up);
+
+    static auto app_weapon_core = sdk::find_type_definition("app.WeaponCore");
+#ifdef RE7
+    static auto app_player_weapon_change_tdef = sdk::find_type_definition("app.PlayerWeaponChange");
+    static auto app_player_weapon_change_type = app_player_weapon_change_tdef != nullptr ? app_player_weapon_change_tdef->get_type() : nullptr;
+    static auto app_equip_manager_tdef = sdk::find_type_definition("app.EquipManager");
+    static auto app_equip_manager_type = app_equip_manager_tdef != nullptr ? app_equip_manager_tdef->get_type() : nullptr;
+    static auto app_weapon_tdef = sdk::find_type_definition("app.Weapon");
+#endif
+
+    auto slot_world_pos = [&](HolsterSlot holster_slot) -> Vector3f {
+        return compute_holster_slot_world_position(holster_slot, head_pos, head_right, head_up, head_forward);
+    };
+
+    auto holster_effective_dist = [&](HolsterSlot s, float d) -> float {
+        float adj = 0.f;
+        switch (s) {
+        case HolsterSlot::LeftShoulder:
+        case HolsterSlot::RightShoulder:
+            if (hand_h < -0.20f) {
+                adj += 0.20f;
+            }
+            break;
+        case HolsterSlot::LeftChest:
+            if (hand_h > -0.10f) {
+                adj += 0.16f;
+            }
+            if (hand_h < -0.45f) {
+                adj += 0.14f;
+            }
+            break;
+        case HolsterSlot::LeftWaist:
+        case HolsterSlot::RightWaist:
+            if (hand_h > -0.30f) {
+                adj += 0.18f;
+            }
+            break;
+        default:
+            break;
+        }
+        return d + adj;
+    };
+
+    auto find_hovered_slot = [&]() -> std::optional<HolsterSlot> {
+        // RightChest (index 2) is unused: same body region as the medicine/heal volume (RightShoulderHeal).
+        static constexpr HolsterSlot weapon_slots[] = {
+            HolsterSlot::LeftShoulder,
+            HolsterSlot::LeftChest,
+            HolsterSlot::RightShoulder,
+            HolsterSlot::LeftWaist,
+            HolsterSlot::RightWaist
+        };
+
+        float best_score = 999.0f;
+        std::optional<HolsterSlot> best{};
+
+        for (auto s : weapon_slots) {
+            const auto pos = slot_world_pos(s);
+            const auto d = glm::length(rh_pos - pos);
+            if (d > hover_r) {
+                continue;
+            }
+            const auto score = holster_effective_dist(s, d);
+            if (score < best_score) {
+                best_score = score;
+                best = s;
+            }
+        }
+
+        if (best) {
+            return best;
+        }
+
+        return std::nullopt;
+    };
+
+    auto hovered = find_hovered_slot();
+
+    if (glm::length(rh_pos - heal_slot_pos) <= m_holster_heal_blocks_weapon_m) {
+        hovered = std::nullopt;
+    }
+
+    if (hovered) {
+        const auto new_hover = !m_weapon_holster.has_hovered_slot || m_weapon_holster.hovered_slot != *hovered;
+        const auto time_ok = (now - m_weapon_holster.last_haptic_time) > std::chrono::milliseconds(150);
+
+        if (new_hover && time_ok) {
+            vr->trigger_haptic_vibration(0.0f, 0.06f, 1.0f, 2.5f, right_joystick);
+            m_weapon_holster.last_haptic_time = now;
+        }
+
+        m_weapon_holster.hovered_slot = *hovered;
+        m_weapon_holster.has_hovered_slot = true;
+    } else {
+        m_weapon_holster.has_hovered_slot = false;
+    }
+
+    auto holster_weapon_slot_has_assignment = [&](HolsterSlot s) -> bool {
+        const auto si = static_cast<size_t>(s);
+        return !m_weapon_holster.slot_weapon_id[si].empty() || !m_weapon_holster.slot_weapon_type_id[si].empty();
+    };
+
+    const bool left_grip_released =
+        m_weapon_holster.was_left_grip_for_holster_tune && !is_left_grip_down;
+
+    if (is_left_grip_down) {
+        if (m_weapon_holster.holster_tune_drag_slot < 0) {
+            if (hovered && holster_weapon_slot_has_assignment(*hovered)) {
+                m_weapon_holster.holster_tune_drag_slot = static_cast<int>(*hovered);
+            }
+        }
+        if (m_weapon_holster.holster_tune_drag_slot >= 0) {
+            const auto drag_slot = static_cast<HolsterSlot>(m_weapon_holster.holster_tune_drag_slot);
+            const Vector3f base =
+                compute_holster_slot_base_world_position(drag_slot, head_pos, head_right, head_up, head_forward);
+            const Vector3f delta = rh_pos - base;
+            m_holster_hmd_offset_m[static_cast<size_t>(m_weapon_holster.holster_tune_drag_slot)] = Vector3f{
+                glm::dot(delta, head_right), glm::dot(delta, head_up), glm::dot(delta, head_forward)};
+
+            const auto pulse_ok =
+                (now - m_weapon_holster.last_holster_tune_mode_haptic_time) > std::chrono::milliseconds(300);
+            if (pulse_ok) {
+                vr->trigger_haptic_vibration(0.0f, 0.035f, 1.0f, 0.35f, right_joystick);
+                m_weapon_holster.last_holster_tune_mode_haptic_time = now;
+            }
+        }
+    } else {
+        if (left_grip_released && m_weapon_holster.holster_tune_drag_slot >= 0) {
+            m_holster_tune_last_slot = m_weapon_holster.holster_tune_drag_slot;
+            m_holster_tune_nonce++;
+            vr->trigger_haptic_vibration(0.0f, 0.14f, 1.0f, 5.0f, right_joystick);
+        }
+        m_weapon_holster.holster_tune_drag_slot = -1;
+    }
+
+    ::REManagedObject* weapon_change = nullptr;
+    ::REManagedObject* equip_controller = nullptr;
+#ifdef RE8
+    weapon_change = sdk::call_object_func_easy<::REManagedObject*>(m_updater, "get_playerWeaponChange");
+    equip_controller = sdk::call_object_func_easy<::REManagedObject*>(m_updater, "get_equipController");
+    if (equip_controller == nullptr && m_order != nullptr) {
+        equip_controller = sdk::call_object_func_easy<::REManagedObject*>(m_order, "get_equipController");
+    }
+#else
+    if (app_player_weapon_change_type != nullptr) {
+        weapon_change = utility::re_component::find<::REManagedObject>(m_player->transform, app_player_weapon_change_type);
+    }
+    if (app_equip_manager_type != nullptr) {
+        equip_controller = utility::re_component::find<::REManagedObject>(m_player->transform, app_equip_manager_type);
+    }
+#endif
+
+    const auto current_weapon = get_weapon_object(m_player);
+    std::string current_weapon_id{};
+    std::string current_weapon_type_id{};
+    if (current_weapon != nullptr) {
+        current_weapon_id = holster_weapon_instance_key(current_weapon);
+
+        if (const auto w_tdef = utility::re_managed_object::get_type_definition(current_weapon); w_tdef != nullptr) {
+            current_weapon_type_id = w_tdef->get_full_name();
+        }
+    }
+
+    const bool has_weapon_in_hand = current_weapon != nullptr
+        && (!current_weapon_id.empty() || !current_weapon_type_id.empty());
+
+#ifdef RE7
+    // RE7: during stow lockout, force de-equip if the game re-equips due to native quickslot/dpad.
+    if (weapon_change != nullptr && now < m_re7_stow_lockout_until) {
+        if (current_weapon != nullptr) {
+            try {
+                sdk::call_object_func_easy<void*>(weapon_change, "removeWeapon");
+            } catch (...) {
+            }
+
+            try {
+                static auto app_player_mesh_controller = sdk::find_type_definition("app.PlayerMeshController");
+                static auto app_player_mesh_controller_type = app_player_mesh_controller != nullptr ? app_player_mesh_controller->get_type() : nullptr;
+                if (app_player_mesh_controller_type != nullptr) {
+                    if (auto mesh_controller = utility::re_component::find<::REManagedObject>(m_player->transform, app_player_mesh_controller_type);
+                        mesh_controller != nullptr) {
+                        try {
+                            sdk::call_object_func_easy<void*>(mesh_controller, "onEquipWeaponChanged", nullptr, current_weapon);
+                        } catch (...) {
+                        }
+
+                        try {
+                            auto weapon_mesh_object = sdk::call_object_func_easy<::REGameObject*>(mesh_controller, "get_weaponMeshObject");
+                            if (weapon_mesh_object != nullptr) {
+                                sdk::call_object_func_easy<void*>(weapon_mesh_object, "setActive", false);
+                            }
+                        } catch (...) {
+                        }
+                    }
+                }
+            } catch (...) {
+            }
+
+            if (equip_controller != nullptr) {
+                try {
+                    sdk::call_object_func_easy<void*>(equip_controller, "set_equipWeaponRight", nullptr);
+                } catch (...) {
+                }
+            }
+
+            try {
+                sdk::call_object_func_easy<void*>(weapon_change, "setWeaponDisp", false);
+            } catch (...) {
+            }
+
+            try {
+                sdk::call_object_func_easy<void*>(current_weapon, "disp", false);
+            } catch (...) {
+            }
+        }
+    }
+#endif
+
+    const bool grip_pressed = is_grip_down && !m_weapon_holster.was_grip_down;
+    const bool grip_released = !is_grip_down && m_weapon_holster.was_grip_down;
+
+    if (is_grip_down) {
+        if (grip_pressed) {
+            m_weapon_holster.holster_grip_ever_outside_slots = !hovered.has_value();
+        } else {
+            m_weapon_holster.holster_grip_ever_outside_slots =
+                m_weapon_holster.holster_grip_ever_outside_slots || !hovered.has_value();
+        }
+    }
+
+    if (grip_released && hovered && has_weapon_in_hand && m_weapon_holster.holster_grip_ever_outside_slots
+        && weapon_change != nullptr) {
+        const auto slot_index = static_cast<int>(*hovered);
+
+        holster_clear_weapon_from_other_slots(current_weapon_id, current_weapon_type_id, slot_index);
+
+        const auto json_label = holster_weapon_json_label(current_weapon, current_weapon_id);
+        m_weapon_holster.slot_weapon_id[static_cast<size_t>(slot_index)] = current_weapon_id;
+        m_weapon_holster.slot_weapon_json_label[static_cast<size_t>(slot_index)] = json_label;
+        m_weapon_holster.slot_weapon_type_id[static_cast<size_t>(slot_index)] = current_weapon_type_id;
+        m_holster_last_assigned_slot = slot_index;
+        m_holster_last_assigned_weapon_id = json_label;
+        m_holster_assignment_nonce++;
+
+ #ifdef RE8
+        sdk::call_object_func_easy<void*>(weapon_change, "removeWeaponWithNoAction");
+ #else
+        // RE7: removeWeapon() alone can leave EquipManager/MeshController state stale.
+        // Mirror the de-equip logic used by RE7 heal gesture.
+        sdk::call_object_func_easy<void*>(weapon_change, "removeWeapon");
+        try {
+            static auto app_player_mesh_controller = sdk::find_type_definition("app.PlayerMeshController");
+            static auto app_player_mesh_controller_type = app_player_mesh_controller != nullptr ? app_player_mesh_controller->get_type() : nullptr;
+
+            if (app_player_mesh_controller_type != nullptr) {
+                if (auto mesh_controller = utility::re_component::find<::REManagedObject>(m_player->transform, app_player_mesh_controller_type);
+                    mesh_controller != nullptr) {
+                    sdk::call_object_func_easy<void*>(mesh_controller, "onEquipWeaponChanged", nullptr, current_weapon);
+
+                    // Some RE7 states keep the mesh visible unless explicitly hidden.
+                    try {
+                        auto weapon_mesh_object = sdk::call_object_func_easy<::REGameObject*>(mesh_controller, "get_weaponMeshObject");
+                        if (weapon_mesh_object != nullptr) {
+                            sdk::call_object_func_easy<void*>(weapon_mesh_object, "setActive", false);
+                        }
+                    } catch (...) {
+                    }
+                }
+            }
+
+            if (equip_controller != nullptr) {
+                auto current_equipped_right = *sdk::get_object_field<::REManagedObject*>(equip_controller, "<equipWeaponRight>k__BackingField");
+                if (current_equipped_right == current_weapon) {
+                    sdk::call_object_func_easy<void*>(equip_controller, "set_equipWeaponRight", nullptr);
+                }
+
+                // Optional: clear item id string if present (harmless if not used).
+                try {
+                    sdk::call_object_func_easy<void*>(equip_controller, "set_equipWeaponItemIDRight", sdk::VM::create_managed_string(L""));
+                } catch (...) {
+                }
+            }
+
+            // Try to hide weapon display state at the weapon-change layer (present on inherited API in RE7).
+            try {
+                sdk::call_object_func_easy<void*>(weapon_change, "setWeaponDisp", false);
+            } catch (...) {
+            }
+
+            // Last resort: hide the weapon itself (should be safe after removeWeapon).
+            try {
+                if (current_weapon != nullptr) {
+                    sdk::call_object_func_easy<void*>(current_weapon, "disp", false);
+                }
+            } catch (...) {
+            }
+
+            // Lockout: if native quickslot re-equips immediately, force it back off for a brief window.
+            m_re7_stow_lockout_until = now + std::chrono::milliseconds(250);
+        } catch (...) {
+        }
+ #endif
+        vr->trigger_haptic_vibration(0.0f, 0.08f, 1.0f, 5.0f, right_joystick);
+    }
+
+    if (grip_pressed && hovered && !has_weapon_in_hand && weapon_change != nullptr && equip_controller != nullptr) {
+        const auto slot_index = static_cast<int>(*hovered);
+        const auto& assigned_id = m_weapon_holster.slot_weapon_id[static_cast<size_t>(slot_index)];
+        const auto& assigned_type_id = m_weapon_holster.slot_weapon_type_id[static_cast<size_t>(slot_index)];
+
+        if (!assigned_id.empty() || !assigned_type_id.empty()) {
+#ifdef RE8
+            auto items_list = *sdk::get_object_field<::REManagedObject*>(m_inventory, "<items>k__BackingField");
+#else
+            auto items_list = *sdk::get_object_field<::REManagedObject*>(m_inventory, "_ItemList");
+#endif
+            if (items_list != nullptr) {
+                auto items = *sdk::get_object_field<sdk::SystemArray*>(items_list, "mItems");
+                if (items != nullptr) {
+                    ::REManagedObject* found_item = nullptr;
+                    ::REGameObject* found_owner = nullptr;
+
+                    for (auto i = 0; i < items->size(); i++) {
+                        auto item = items->get_element(i);
+                        if (item == nullptr) {
+                            continue;
+                        }
+
+ #ifdef RE8
+                        auto owner = *sdk::get_object_field<::REGameObject*>(item, "<owner>k__BackingField");
+ #else
+                        auto owner = *sdk::get_object_field<::REGameObject*>(item, "Owner");
+ #endif
+                        if (owner == nullptr) {
+                            continue;
+                        }
+
+                        const auto owner_name = utility::re_string::get_string(owner->name);
+                        std::string item_key{};
+                        std::string item_type_name{};
+
+#ifdef RE7
+                        // RE7: match holstered weapons using the actual app.Weapon / app.Item, not the inventory wrapper entry.
+                        // The slot stores the current equipped weapon's key/type (from get_weapon_object), so we must compare against
+                        // the weapon resolved from each inventory entry.
+                        ::REManagedObject* item_internal = nullptr;
+                        ::REManagedObject* item_weapon = nullptr;
+                        try {
+                            item_internal = *sdk::get_object_field<::REManagedObject*>(item, "Item");
+                        } catch (...) {
+                        }
+                        if (item_internal != nullptr) {
+                            try {
+                                item_weapon = sdk::call_object_func_easy<::REManagedObject*>(item_internal, "get_weapon");
+                            } catch (...) {
+                            }
+                            if (item_weapon == nullptr) {
+                                try {
+                                    item_weapon = *sdk::get_object_field<::REManagedObject*>(item_internal, "<weapon>k__BackingField");
+                                } catch (...) {
+                                }
+                            }
+                        }
+
+                        if (item_weapon != nullptr) {
+                            item_key = holster_weapon_instance_key(item_weapon);
+                            if (const auto wtd = utility::re_managed_object::get_type_definition(item_weapon); wtd != nullptr) {
+                                item_type_name = wtd->get_full_name();
+                            }
+                        } else if (item_internal != nullptr) {
+                            item_key = holster_weapon_instance_key(item_internal);
+                            if (const auto itd = utility::re_managed_object::get_type_definition(item_internal); itd != nullptr) {
+                                item_type_name = itd->get_full_name();
+                            }
+                        } else {
+                            item_key = holster_weapon_instance_key(item);
+                            if (const auto td = utility::re_managed_object::get_type_definition(item); td != nullptr) {
+                                item_type_name = td->get_full_name();
+                            }
+                        }
+#else
+                        item_key = holster_weapon_instance_key(item);
+                        if (const auto item_tdef = utility::re_managed_object::get_type_definition(item); item_tdef != nullptr) {
+                            item_type_name = item_tdef->get_full_name();
+                        }
+#endif
+
+                        if (holster_item_matches_slot_assignment(
+                                item_key, owner_name, item_type_name, assigned_id, assigned_type_id)) {
+                            found_item = item;
+                            found_owner = owner;
+                            break;
+                        }
+                    }
+
+                    if (found_owner != nullptr) {
+ #ifdef RE8
+                        sdk::call_object_func_easy<void*>(weapon_change, "removeWeaponWithNoAction");
+ #else
+                        sdk::call_object_func_easy<void*>(weapon_change, "removeWeapon");
+ #endif
+                        bool equipped = false;
+
+#ifdef RE7
+                        // RE7: equip is driven by app.PlayerWeaponChange.equipWeapon(app.Item, app.Weapon).
+                        // Inventory list entries vary; resolve an actual app.Item first, then ask it for its app.Weapon.
+                        static auto app_item_tdef = sdk::find_type_definition("app.Item");
+                        const auto is_item = [&](::REManagedObject* o) -> bool {
+                            if (o == nullptr || app_item_tdef == nullptr) {
+                                return false;
+                            }
+                            const auto td = utility::re_managed_object::get_type_definition(o);
+                            return td != nullptr && td->is_a(app_item_tdef);
+                        };
+
+                        auto resolve_item_from_inventory_entry = [&](::REManagedObject* entry) -> ::REManagedObject* {
+                            if (entry == nullptr) {
+                                return nullptr;
+                            }
+                            if (is_item(entry)) {
+                                return entry;
+                            }
+
+                            // Common wrapper patterns in RE7 inventory lists.
+                            for (const char* field : { "Item", "<Item>k__BackingField", "<item>k__BackingField", "_Item", "_item" }) {
+                                try {
+                                    if (auto p = sdk::get_object_field<::REManagedObject*>(entry, field); p != nullptr && *p != nullptr && is_item(*p)) {
+                                        return *p;
+                                    }
+                                } catch (...) {
+                                }
+                            }
+
+                            return nullptr;
+                        };
+
+                        ::REManagedObject* found_item_internal = resolve_item_from_inventory_entry(found_item);
+                        ::REManagedObject* found_weapon = nullptr;
+                        if (found_item_internal != nullptr) {
+                            try {
+                                found_weapon = sdk::call_object_func_easy<::REManagedObject*>(found_item_internal, "get_weapon");
+                            } catch (...) {
+                            }
+
+                            if (found_weapon == nullptr) {
+                                try {
+                                    found_weapon = *sdk::get_object_field<::REManagedObject*>(found_item_internal, "<weapon>k__BackingField");
+                                } catch (...) {
+                                }
+                            }
+                        }
+
+                        const auto is_weapon = [&](::REManagedObject* o) -> bool {
+                            if (o == nullptr || app_weapon_tdef == nullptr) {
+                                return false;
+                            }
+                            const auto td = utility::re_managed_object::get_type_definition(o);
+                            return td != nullptr && td->is_a(app_weapon_tdef);
+                        };
+
+                        if (!equipped && found_item_internal != nullptr && is_weapon(found_weapon)) {
+                            try {
+                                // Primary: PlayerWeaponChange equips from app.Item + app.Weapon.
+                                sdk::call_object_func_easy<void*>(weapon_change, "equipWeapon(app.Item, app.Weapon)", found_item_internal, found_weapon);
+                                equipped = true;
+                            } catch (...) {
+                            }
+                        }
+
+                        if (!equipped && equip_controller != nullptr && is_weapon(found_weapon)) {
+                            try {
+                                // Fallback: EquipManager equips a weapon into a hand (0 = right).
+                                sdk::call_object_func_easy<void*>(equip_controller, "equipWeapon(app.Weapon, app.CharacterDefine.Hand)", found_weapon, 0);
+                                equipped = true;
+                            } catch (...) {
+                            }
+                        }
+
+                        if (!equipped && equip_controller != nullptr && is_weapon(found_weapon)) {
+                            try {
+                                // Alternate RE7 path: EquipManager.applyEquipWeapon(app.Weapon, Hand).
+                                sdk::call_object_func_easy<void*>(equip_controller, "applyEquipWeapon(app.Weapon, app.CharacterDefine.Hand)", found_weapon, 0);
+                                equipped = true;
+                            } catch (...) {
+                            }
+                        }
+
+                        // RE7: ensure the visible weapon mesh state is restored after a stow path that explicitly hid it.
+                        if (equipped) {
+                            try {
+                                // RE7: synchronize native "equipped weapon id" state used by dpad weapon switching.
+                                // If we don't update this, the game can immediately snap back to whatever WeaponID the native dpad system thinks is selected.
+                                if (equip_controller != nullptr && found_weapon != nullptr) {
+                                    // Keep EquipManager's object and id fields consistent.
+                                    try {
+                                        sdk::call_object_func_easy<void*>(equip_controller, "set_equipWeaponRight", found_weapon);
+                                    } catch (...) {
+                                    }
+
+                                    // EquipWeaponIdRight is an app.WeaponID (enum); store underlying int32.
+                                    try {
+                                        const auto weapon_id = sdk::call_object_func_easy<int32_t>(found_weapon, "get_weaponID");
+                                        if (auto p = sdk::get_object_field<int32_t>(equip_controller, "EquipWeaponIdRight"); p != nullptr) {
+                                            *p = weapon_id;
+                                        }
+                                    } catch (...) {
+                                    }
+                                }
+
+                                // EquipWeaponItemIDRight also participates in native selection/state in RE7.
+                                if (equip_controller != nullptr && found_item_internal != nullptr) {
+                                    try {
+                                        auto item_id = *sdk::get_object_field<::SystemString*>(found_item_internal, "ItemDataID");
+                                        if (item_id != nullptr) {
+                                            // Setter expects a managed System.String.
+                                            sdk::call_object_func_easy<void*>(equip_controller, "set_equipWeaponItemIDRight", item_id);
+                                        }
+                                    } catch (...) {
+                                    }
+                                }
+
+                                // CRITICAL (RE7): update the native inventory equip selection so the game's dpad system adopts our choice.
+                                // Without this, the game can snap back to the previously-selected quickslot weapon after our holster equip.
+                                if (m_inventory != nullptr && found_item_internal != nullptr) {
+                                    try {
+                                        auto item_id = *sdk::get_object_field<::SystemString*>(found_item_internal, "ItemDataID");
+                                        if (item_id != nullptr) {
+                                            // Knife/melee handling:
+                                            // Quickslot/dpad is primarily for Gun category. For Melee, applying quickslot can immediately overwrite
+                                            // the newly equipped melee weapon back to the current quickslot gun selection.
+                                            bool is_melee = false;
+                                            try {
+                                                // app.WeaponCategory is an enum (Gun=0, Melee=1, Others=2).
+                                                const auto cat = sdk::call_object_func_easy<int32_t>(found_weapon, "get_weaponCategory");
+                                                is_melee = (cat == 1);
+                                            } catch (...) {
+                                            }
+
+                                            // Reset native equip state, then equip by ItemDataID (the same path used by the game's own UI/quickslot).
+                                            try {
+                                                sdk::call_object_func_easy<void*>(m_inventory, "removeEquip");
+                                            } catch (...) {
+                                            }
+
+                                            sdk::call_object_func_easy<void*>(m_inventory, "equipWeapon", item_id);
+
+                                            // Apply quickslot mapping after changing equip state (prevents immediate overwrite by the quickslot system).
+                                            // For melee (knife), DO NOT apply quickslot because it can force-switch back to the selected gun.
+                                            if (!is_melee) {
+                                                try {
+                                                    sdk::call_object_func_easy<void*>(m_inventory, "applyQuickSlot");
+                                                } catch (...) {
+                                                }
+                                            }
+                                        }
+                                    } catch (...) {
+                                    }
+                                }
+
+                                // Re-enable weapon display at the weapon-change layer if supported.
+                                try {
+                                    sdk::call_object_func_easy<void*>(weapon_change, "setWeaponDisp", true);
+                                } catch (...) {
+                                }
+
+                                static auto app_player_mesh_controller = sdk::find_type_definition("app.PlayerMeshController");
+                                static auto app_player_mesh_controller_type = app_player_mesh_controller != nullptr ? app_player_mesh_controller->get_type() : nullptr;
+
+                                if (app_player_mesh_controller_type != nullptr) {
+                                    if (auto mesh_controller = utility::re_component::find<::REManagedObject>(m_player->transform, app_player_mesh_controller_type);
+                                        mesh_controller != nullptr) {
+                                        // Notify mesh controller of new weapon and refresh parts.
+                                        sdk::call_object_func_easy<void*>(mesh_controller, "onEquipWeaponChanged", found_weapon, nullptr);
+
+                                        try {
+                                            auto weapon_mesh_object = sdk::call_object_func_easy<::REGameObject*>(mesh_controller, "get_weaponMeshObject");
+                                            if (weapon_mesh_object != nullptr) {
+                                                sdk::call_object_func_easy<void*>(weapon_mesh_object, "setActive", true);
+                                            }
+                                        } catch (...) {
+                                        }
+
+                                        try {
+                                            sdk::call_object_func_easy<void*>(mesh_controller, "updateParts");
+                                        } catch (...) {
+                                        }
+                                    }
+                                }
+
+                                // Ensure the weapon itself is visible.
+                                try {
+                                    if (found_weapon != nullptr) {
+                                        sdk::call_object_func_easy<void*>(found_weapon, "disp", true);
+                                    }
+                                } catch (...) {
+                                }
+                            } catch (...) {
+                            }
+                        }
+#endif
+
+                        if (found_item != nullptr && app_weapon_core != nullptr
+                            && utility::re_managed_object::get_type_definition(found_item)->is_a(app_weapon_core)) {
+                            try {
+                                sdk::call_object_func_easy<void*>(weapon_change, "equipWeapon(app.WeaponCore, System.Boolean)", found_item, false);
+                                equipped = true;
+                            } catch (...) {}
+
+                            if (!equipped) {
+                                try {
+                                    sdk::call_object_func_easy<void*>(equip_controller, "equipWeapon(app.WeaponCore)", found_item);
+                                    equipped = true;
+                                } catch (...) {}
+                            }
+
+                            if (!equipped) {
+                                try {
+                                    sdk::call_object_func_easy<void*>(equip_controller, "equipWeapon(app.WeaponCore, app.EquipSlot)", found_item, 0);
+                                    equipped = true;
+                                } catch (...) {}
+                            }
+                        }
+
+                        if (!equipped) {
+#ifdef RE8
+                            sdk::call_object_func_easy<void*>(equip_controller, "equipObject", found_owner);
+#else
+                            // RE7 last resort: try equipping by WeaponID into right hand if possible.
+                            // (Leaving empty if we couldn't resolve an app.Weapon.)
+#endif
+                        }
+
+                        vr->trigger_haptic_vibration(0.0f, 0.06f, 1.0f, 4.0f, right_joystick);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!is_grip_down) {
+        m_weapon_holster.holster_grip_ever_outside_slots = false;
+    }
+
+    m_weapon_holster.was_left_grip_for_holster_tune = is_left_grip_down;
+    m_weapon_holster.was_grip_down = is_grip_down;
+}
+
 HookManager::PreHookResult RE8VR::pre_shadow_late_update(std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr) {
     auto& vr = VR::get();
     auto& re8vr = RE8VR::get();
@@ -1511,7 +2568,8 @@ void RE8VR::apply_recoil_kickback(::REManagedObject* weapon_for_id) {
     }
 
     // Per-weapon intensity (1–4, default 1). Use the weapon that is actually firing for the lookup when called from the shoot hook.
-    const float weapon_mult = get_weapon_recoil_multiplier(weapon_for_id);
+    const bool is_two_hands = m_was_gripping_weapon || m_is_reloading;
+    const float weapon_mult = get_weapon_recoil_multiplier(weapon_for_id, is_two_hands);
     if (weapon_mult <= 0.0f) {
         return;
     }
@@ -1583,18 +2641,27 @@ void RE8VR::update_recoil(float dt) {
     constexpr float pi_half = 1.5707963267948966f;
     dt = std::min(dt, 0.05f);
 
-    // Cancel recoil when weapon has no ammo so the view doesn't stay kicked
+    // Cancel recoil when weapon has no ammo so the view doesn't stay kicked.
+    // NOTE: On RE7, the *last* bullet sets ammo to 0 immediately after a successful shot.
+    // We must not cancel recoil in that case, otherwise the last shot appears to have "no recoil".
     if (m_weapon != nullptr && get_weapon_ammo_count(m_weapon) == 0) {
-        m_recoil = {};
-        m_recoil_attack_active = false;
-        m_recoil_attack_t = 0.0f;
-        m_recoil_attack_pos_y = 0.0f;
-        m_recoil_attack_pos_z = 0.0f;
-        m_recoil_attack_pitch = 0.0f;
-        m_recoil_attack_yaw = 0.0f;
-        m_recoil_active = false;
-        m_recoil_last_t = 0.0f;
-        return;
+        const float now = (float)std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const float since_last_shot = (m_recoil_last_shot_t > 0.0f) ? (now - m_recoil_last_shot_t) : 999.0f;
+
+        // Allow the recoil impulse to play out briefly even at 0 ammo.
+        // This still prevents "stuck kicked view" on empty/dry-fire because last_shot_t won't be updated on failed shots.
+        if (!m_recoil_attack_active && since_last_shot > 0.25f) {
+            m_recoil = {};
+            m_recoil_attack_active = false;
+            m_recoil_attack_t = 0.0f;
+            m_recoil_attack_pos_y = 0.0f;
+            m_recoil_attack_pos_z = 0.0f;
+            m_recoil_attack_pitch = 0.0f;
+            m_recoil_attack_yaw = 0.0f;
+            m_recoil_active = false;
+            m_recoil_last_t = 0.0f;
+            return;
+        }
     }
 
     if (!m_recoil_active && !m_recoil_attack_active) {
@@ -1726,23 +2793,52 @@ std::string RE8VR::get_current_weapon_recoil_id() const {
     return get_weapon_recoil_id(m_weapon);
 }
 
-void RE8VR::set_per_weapon_recoil_intensity(const std::string& weapon_id, float intensity) {
+void RE8VR::set_per_weapon_recoil_one_hand(const std::string& weapon_id, float intensity) {
     if (weapon_id.empty()) {
         return;
     }
     intensity = std::max(1.0f, std::min(4.0f, intensity));
-    m_per_weapon_recoil_intensity[weapon_id] = intensity;
+    auto& p = m_per_weapon_recoil[weapon_id];
+    p.one_hand = intensity;
 }
 
-float RE8VR::get_per_weapon_recoil_intensity(const std::string& weapon_id) const {
+float RE8VR::get_per_weapon_recoil_one_hand(const std::string& weapon_id) const {
     if (weapon_id.empty()) {
         return 1.0f;
     }
-    auto it = m_per_weapon_recoil_intensity.find(weapon_id);
-    if (it != m_per_weapon_recoil_intensity.end()) {
-        return it->second;
+    if (auto it = m_per_weapon_recoil.find(weapon_id); it != m_per_weapon_recoil.end()) {
+        return it->second.one_hand;
     }
     return 1.0f;
+}
+
+void RE8VR::set_per_weapon_recoil_two_hands(const std::string& weapon_id, float intensity) {
+    if (weapon_id.empty()) {
+        return;
+    }
+    intensity = std::max(1.0f, std::min(4.0f, intensity));
+    auto& p = m_per_weapon_recoil[weapon_id];
+    p.two_hands = intensity;
+}
+
+float RE8VR::get_per_weapon_recoil_two_hands(const std::string& weapon_id) const {
+    if (weapon_id.empty()) {
+        return 1.0f;
+    }
+    if (auto it = m_per_weapon_recoil.find(weapon_id); it != m_per_weapon_recoil.end()) {
+        return it->second.two_hands;
+    }
+    return 1.0f;
+}
+
+void RE8VR::set_per_weapon_recoil_intensity(const std::string& weapon_id, float intensity) {
+    // Back-compat: treat as two-handed value.
+    set_per_weapon_recoil_two_hands(weapon_id, intensity);
+}
+
+float RE8VR::get_per_weapon_recoil_intensity(const std::string& weapon_id) const {
+    // Back-compat: treat as two-handed value.
+    return get_per_weapon_recoil_two_hands(weapon_id);
 }
 
 void RE8VR::load_recoil_settings() {
@@ -1753,12 +2849,32 @@ void RE8VR::load_recoil_settings() {
     }
     try {
         json j = json::parse(f);
-        m_per_weapon_recoil_intensity.clear();
+        m_per_weapon_recoil.clear();
         if (j.contains("weapons") && j["weapons"].is_object()) {
             for (auto& [key, val] : j["weapons"].items()) {
-                if (val.is_object() && val.contains("intensity") && val["intensity"].is_number()) {
-                    float v = val["intensity"].get<float>();
-                    m_per_weapon_recoil_intensity[key] = std::max(1.0f, std::min(4.0f, v));
+                if (!val.is_object()) {
+                    continue;
+                }
+
+                auto& p = m_per_weapon_recoil[key];
+
+                // Preferred schema: { one_hand, two_hands }
+                if (val.contains("one_hand") && val["one_hand"].is_number()) {
+                    p.one_hand = std::max(1.0f, std::min(4.0f, val["one_hand"].get<float>()));
+                }
+                if (val.contains("two_hands") && val["two_hands"].is_number()) {
+                    p.two_hands = std::max(1.0f, std::min(4.0f, val["two_hands"].get<float>()));
+                }
+
+                // Back-compat: { intensity } means "two_hands" (and if one_hand not provided, copy it)
+                if (val.contains("intensity") && val["intensity"].is_number()) {
+                    const float v = std::max(1.0f, std::min(4.0f, val["intensity"].get<float>()));
+                    if (!(val.contains("two_hands") && val["two_hands"].is_number())) {
+                        p.two_hands = v;
+                    }
+                    if (!(val.contains("one_hand") && val["one_hand"].is_number())) {
+                        p.one_hand = v;
+                    }
                 }
             }
         }
@@ -1773,8 +2889,8 @@ void RE8VR::save_recoil_settings() {
         std::filesystem::create_directories(path.parent_path());
         json j = json::object();
         j["weapons"] = json::object();
-        for (const auto& [weapon_id, intensity] : m_per_weapon_recoil_intensity) {
-            j["weapons"][weapon_id] = json::object({ {"intensity", intensity} });
+        for (const auto& [weapon_id, p] : m_per_weapon_recoil) {
+            j["weapons"][weapon_id] = json::object({ {"one_hand", p.one_hand}, {"two_hands", p.two_hands} });
         }
         std::ofstream f(path);
         if (f) {
@@ -1790,11 +2906,25 @@ float RE8VR::get_weapon_recoil_multiplier() const {
 }
 
 float RE8VR::get_weapon_recoil_multiplier(::REManagedObject* weapon) const {
+    return get_weapon_recoil_multiplier(weapon, true);
+}
+
+float RE8VR::get_weapon_recoil_multiplier(::REManagedObject* weapon, const bool is_two_hands) const {
     if (weapon == nullptr) {
         return 1.0f;
     }
-    const float weapon_intensity = get_per_weapon_recoil_intensity(get_weapon_recoil_id(weapon));
-    return weapon_intensity;
+
+    const auto id = get_weapon_recoil_id(weapon);
+    if (id.empty()) {
+        return 1.0f;
+    }
+
+    if (auto it = m_per_weapon_recoil.find(id); it != m_per_weapon_recoil.end()) {
+        return is_two_hands ? it->second.two_hands : it->second.one_hand;
+    }
+
+    // Default when missing: no one-hand boost unless explicitly configured.
+    return 1.0f;
 }
 
 Vector3f RE8VR::get_recoil_position_offset_world(const glm::quat& camera_rotation) const {
@@ -1814,13 +2944,29 @@ int32_t RE8VR::get_weapon_ammo_count(::REManagedObject* weapon) const {
     if (weapon == nullptr) {
         return -1;
     }
+
+#ifndef RE8
+    // RE7 fast-path: WeaponGun exposes get_loadNum(). Cache method lookup.
+    static sdk::RETypeDefinition* s_weapon_gun_tdef = sdk::find_type_definition("app.WeaponGun");
+    static sdk::REMethodDefinition* s_weapon_gun_get_load_num = s_weapon_gun_tdef != nullptr ? s_weapon_gun_tdef->get_method("get_loadNum") : nullptr;
+    if (s_weapon_gun_tdef != nullptr && s_weapon_gun_get_load_num != nullptr) {
+        if (auto* tdef = utility::re_managed_object::get_type_definition(weapon); tdef != nullptr && tdef->is_a(s_weapon_gun_tdef)) {
+            try {
+                return s_weapon_gun_get_load_num->call<int32_t>(sdk::get_thread_context(), weapon);
+            } catch (...) {
+            }
+        }
+    }
+#endif
+
     auto try_obj = [](::REManagedObject* obj) -> int32_t {
         if (obj == nullptr) return -1;
         auto* tdef = utility::re_managed_object::get_type_definition(obj);
         if (tdef == nullptr) return -1;
         static const char* field_names[] = {
             "<RemainBullet>k__BackingField", "RemainBullet", "_RemainBullet",
-            "<CurrentBullet>k__BackingField", "CurrentBullet", "Num", "<Num>k__BackingField"
+            "<CurrentBullet>k__BackingField", "CurrentBullet", "Num", "<Num>k__BackingField",
+            "<loadNum>k__BackingField", "loadNum", "_loadNum"
         };
         for (const char* name : field_names) {
             auto* pi32 = sdk::get_object_field<int32_t>(obj, name, false);
@@ -1830,7 +2976,8 @@ int32_t RE8VR::get_weapon_ammo_count(::REManagedObject* weapon) const {
         }
         static const char* method_names[] = {
             "get_RemainBullet", "get_CurrentBullet", "get_remainBullet",
-            "get_RemainNum", "get_CurrentNum", "get_LeftBullet", "get_NumRemain", "get_Num"
+            "get_RemainNum", "get_CurrentNum", "get_LeftBullet", "get_NumRemain", "get_Num",
+            "get_loadNum"
         };
         for (const char* method_name : method_names) {
             auto* method = tdef->get_method(method_name);
@@ -1882,6 +3029,76 @@ void RE8VR::post_weapon_shoot(uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty,
     }
 }
 
+bool RE8VR::get_recoil_enabled() const {
+    return m_recoil_enabled != nullptr ? m_recoil_enabled->value() : false;
+}
+
+void RE8VR::set_recoil_enabled(const bool enabled) {
+    if (m_recoil_enabled != nullptr) {
+        m_recoil_enabled->value() = enabled;
+    }
+}
+
+float RE8VR::get_recoil_intensity() const {
+    return m_recoil_intensity != nullptr ? m_recoil_intensity->value() : 1.0f;
+}
+
+void RE8VR::set_recoil_intensity(const float intensity) {
+    if (m_recoil_intensity != nullptr) {
+        m_recoil_intensity->value() = std::clamp(intensity, 1.0f, 4.0f);
+    }
+}
+
+float RE8VR::get_recoil_attack_duration() const {
+    return m_recoil_attack_duration != nullptr ? m_recoil_attack_duration->value() : RECOIL_ATTACK_DURATION;
+}
+
+void RE8VR::set_recoil_attack_duration(const float v) {
+    if (m_recoil_attack_duration != nullptr) {
+        m_recoil_attack_duration->value() = std::clamp(v, 0.005f, 0.06f);
+    }
+}
+
+float RE8VR::get_recoil_spring_stiffness() const {
+    return m_recoil_spring_stiffness != nullptr ? m_recoil_spring_stiffness->value() : RECOIL_SPRING_STIFFNESS;
+}
+
+void RE8VR::set_recoil_spring_stiffness(const float v) {
+    if (m_recoil_spring_stiffness != nullptr) {
+        m_recoil_spring_stiffness->value() = std::clamp(v, 80.0f, 250.0f);
+    }
+}
+
+float RE8VR::get_recoil_spring_damping() const {
+    return m_recoil_spring_damping != nullptr ? m_recoil_spring_damping->value() : RECOIL_SPRING_DAMPING;
+}
+
+void RE8VR::set_recoil_spring_damping(const float v) {
+    if (m_recoil_spring_damping != nullptr) {
+        m_recoil_spring_damping->value() = std::clamp(v, 12.0f, 35.0f);
+    }
+}
+
+float RE8VR::get_recoil_sustained_damping() const {
+    return m_recoil_sustained_damping != nullptr ? m_recoil_sustained_damping->value() : RECOIL_SUSTAINED_DAMPING;
+}
+
+void RE8VR::set_recoil_sustained_damping(const float v) {
+    if (m_recoil_sustained_damping != nullptr) {
+        m_recoil_sustained_damping->value() = std::clamp(v, 24.0f, 45.0f);
+    }
+}
+
+float RE8VR::get_recoil_sustained_window() const {
+    return m_recoil_sustained_window != nullptr ? m_recoil_sustained_window->value() : RECOIL_SUSTAINED_WINDOW;
+}
+
+void RE8VR::set_recoil_sustained_window(const float v) {
+    if (m_recoil_sustained_window != nullptr) {
+        m_recoil_sustained_window->value() = std::clamp(v, 0.06f, 0.25f);
+    }
+}
+
 void RE8VR::update_heal_gesture() {
 #ifdef RE7
     if (m_inventory == nullptr) {
@@ -1891,23 +3108,42 @@ void RE8VR::update_heal_gesture() {
         m_wants_heal = false;
         m_heal_gesture.was_grip_down = false;
         m_heal_gesture.was_trigger_down = false;
+        m_heal_gesture.raw_was_grip_down = false;
+        m_heal_gesture.heal_grip_began_inside_slot = false;
+        m_heal_gesture.cached_medicine_item = nullptr;
+        m_heal_gesture.cached_medicine_owner = nullptr;
 
         return;
     }
 
     auto& vr = VR::get();
 
-    const auto hmd_forward = vr->get_transform(0)[2];
-    const auto flattened_forward = glm::normalize(Vector3f{hmd_forward.x, 0.0f, hmd_forward.z});
+    const auto hmd = vr->get_transform(0);
+    const Vector3f head_pos{hmd[3]};
+    const Vector3f head_right{hmd[0]};
+    const Vector3f head_up{hmd[1]};
+    const Vector3f head_forward{hmd[2]};
 
-    const auto right_hand_dot_flat_raw = glm::dot(flattened_forward, m_hmd_dir_to_right);
-    const auto right_hand_behind = right_hand_dot_flat_raw >= 0.2f;
+    const auto right_hand = vr->get_transform(vr->get_controllers()[1]);
+    const Vector3f rh_pos{right_hand[3]};
+
+    const Vector3f heal_slot_pos =
+        compute_holster_slot_world_position(HolsterSlot::RightShoulderHeal, head_pos, head_right, head_up, head_forward);
+    const auto in_heal_slot = glm::length(rh_pos - heal_slot_pos) <= m_holster_heal_inner_m;
 
     const auto right_joystick = vr->get_right_joystick();
     const auto action_trigger = vr->get_action_trigger();
     const auto action_grip = vr->get_action_grip();
     const auto is_trigger_down = vr->is_action_active(action_trigger, right_joystick);
     const auto is_grip_down = vr->is_action_active(action_grip, right_joystick);
+
+    const bool heal_raw_grip_pressed = is_grip_down && !m_heal_gesture.raw_was_grip_down;
+    if (!is_grip_down) {
+        m_heal_gesture.heal_grip_began_inside_slot = false;
+    } else if (heal_raw_grip_pressed) {
+        m_heal_gesture.heal_grip_began_inside_slot = in_heal_slot;
+    }
+    m_heal_gesture.raw_was_grip_down = is_grip_down;
 
 #ifdef RE8
     static auto app_medicine_core = sdk::find_type_definition("app.MedicineCore");
@@ -1932,6 +3168,7 @@ void RE8VR::update_heal_gesture() {
 
     if (items_list == nullptr || weapon_change == nullptr || mesh_controller == nullptr) {
         spdlog::info("[RE8VR] Could not find inventory, weapon change, or mesh controller");
+        m_heal_gesture.heal_grip_began_inside_slot = false;
         return;
     }
 
@@ -1944,32 +3181,53 @@ void RE8VR::update_heal_gesture() {
     }
 
     ::REManagedObject* medicine_item = nullptr;
+    ::REGameObject* owner = nullptr;
 
-    for (auto i = 0; i < items->size(); i++) {
-        auto item = items->get_element(i);
+    if (m_heal_gesture.cached_medicine_item != nullptr && m_heal_gesture.cached_medicine_owner != nullptr) {
+        medicine_item = m_heal_gesture.cached_medicine_item;
+        owner = m_heal_gesture.cached_medicine_owner;
 
-        if (item == nullptr) {
-            continue;
+        // Validate cache quickly (owner link can break when inventory refreshes).
+#ifdef RE7
+        auto cached_owner = *sdk::get_object_field<::REGameObject*>(medicine_item, "Owner");
+#else
+        auto cached_owner = *sdk::get_object_field<::REGameObject*>(medicine_item, "<owner>k__BackingField");
+#endif
+        if (cached_owner == nullptr || cached_owner != owner) {
+            medicine_item = nullptr;
+            owner = nullptr;
+            m_heal_gesture.cached_medicine_item = nullptr;
+            m_heal_gesture.cached_medicine_owner = nullptr;
         }
+    }
+
+    if (medicine_item == nullptr) {
+        for (auto i = 0; i < items->size(); i++) {
+            auto item = items->get_element(i);
+
+            if (item == nullptr) {
+                continue;
+            }
 
 #ifdef RE8
-        const auto is_medicine = utility::re_managed_object::get_type_definition(item)->is_a(app_medicine_core);
+            const auto is_medicine = utility::re_managed_object::get_type_definition(item)->is_a(app_medicine_core);
 #else
-        bool is_medicine = false;
-        auto item_internal = *sdk::get_object_field<::REManagedObject*>(item, "Item");
+            bool is_medicine = false;
+            auto item_internal = *sdk::get_object_field<::REManagedObject*>(item, "Item");
 
-        if (item_internal != nullptr) {
-            auto item_name = *sdk::get_object_field<::SystemString*>(item_internal, "ItemDataID");
+            if (item_internal != nullptr) {
+                auto item_name = *sdk::get_object_field<::SystemString*>(item_internal, "ItemDataID");
 
-            if (item_name != nullptr) {
-                is_medicine = utility::re_string::get_string(item_name).find("Remedy") != std::string::npos;
+                if (item_name != nullptr) {
+                    is_medicine = utility::re_string::get_string(item_name).find("Remedy") != std::string::npos;
+                }
             }
-        }
 #endif
 
-        if (is_medicine) {
-            medicine_item = item;
-            break;
+            if (is_medicine) {
+                medicine_item = item;
+                break;
+            }
         }
     }
 
@@ -1977,25 +3235,38 @@ void RE8VR::update_heal_gesture() {
         m_wants_heal = false;
         m_heal_gesture.was_grip_down = false;
         m_heal_gesture.was_trigger_down = false;
+        m_heal_gesture.heal_grip_began_inside_slot = false;
 
         return;
     }
 
 #ifdef RE7
     auto item_internal = *sdk::get_object_field<::REManagedObject*>(medicine_item, "Item");
-    auto owner = *sdk::get_object_field<::REGameObject*>(medicine_item, "Owner");
+    if (owner == nullptr) {
+        owner = *sdk::get_object_field<::REGameObject*>(medicine_item, "Owner");
+    }
 #else
-    auto owner = *sdk::get_object_field<::REGameObject*>(medicine_item, "<owner>k__BackingField");
+    if (owner == nullptr) {
+        owner = *sdk::get_object_field<::REGameObject*>(medicine_item, "<owner>k__BackingField");
+    }
 #endif
 
     if (owner == nullptr) {
         m_wants_heal = false;
         m_heal_gesture.was_grip_down = false;
         m_heal_gesture.was_trigger_down = false;
+        m_heal_gesture.heal_grip_began_inside_slot = false;
+        m_heal_gesture.cached_medicine_item = nullptr;
+        m_heal_gesture.cached_medicine_owner = nullptr;
 
         spdlog::info("[RE8VR] Medicine has no owner");
 
         return;
+    }
+
+    if (m_heal_gesture.cached_medicine_item != medicine_item || m_heal_gesture.cached_medicine_owner != owner) {
+        m_heal_gesture.cached_medicine_item = medicine_item;
+        m_heal_gesture.cached_medicine_owner = owner;
     }
 
     static auto via_render_mesh = sdk::find_type_definition("via.render.Mesh");
@@ -2032,10 +3303,9 @@ void RE8VR::update_heal_gesture() {
     };
 
     if (!is_same_mesh) {
-        if (!is_trigger_down && (
-            (right_hand_behind && !m_heal_gesture.was_grip_down && glm::length(m_hmd_delta_to_right) <= 0.35f) 
-            || (now - m_heal_gesture.last_grab_time) < std::chrono::milliseconds(500))) 
-        {
+        const bool heal_post_grab_grace = m_heal_gesture.heal_grip_began_inside_slot
+            && (now - m_heal_gesture.last_grab_time) < std::chrono::milliseconds(500);
+        if (!is_trigger_down && m_heal_gesture.heal_grip_began_inside_slot && (in_heal_slot || heal_post_grab_grace)) {
             vr->trigger_haptic_vibration(0.0f, 0.1f, 1.0f, 5.0f, right_joystick);
 
             if (is_grip_down) {
