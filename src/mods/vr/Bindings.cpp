@@ -142,6 +142,10 @@ std::string VR::actions_json = R"(
       "type": "boolean"
     },
     {
+      "name": "/actions/default/in/TouchpadTouch",
+      "type": "boolean"
+    },
+    {
       "name": "/actions/default/out/Haptic",
       "type": "vibration"
     }
@@ -416,7 +420,37 @@ std::string VR::bindings_oculus_touch_json = R"(
                   }
                },
                "mode" : "joystick",
+               "path" : "/user/hand/left/input/thumbstick"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/default/in/joystickclick"
+                  },
+                  "position" : {
+                     "output" : "/actions/default/in/joystick"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/joysticktouch"
+                  }
+               },
+               "mode" : "joystick",
                "path" : "/user/hand/right/input/joystick"
+            },
+            {
+               "inputs" : {
+                  "click" : {
+                     "output" : "/actions/default/in/joystickclick"
+                  },
+                  "position" : {
+                     "output" : "/actions/default/in/joystick"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/joysticktouch"
+                  }
+               },
+               "mode" : "joystick",
+               "path" : "/user/hand/right/input/thumbstick"
             },
             {
                "inputs" : {
@@ -709,6 +743,9 @@ std::string VR::bindings_knuckles = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/touchpadclick"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/touchpadtouch"
                   }
                },
                "mode" : "button",
@@ -835,6 +872,9 @@ std::string VR::bindings_knuckles = R"(
                "inputs" : {
                   "click" : {
                      "output" : "/actions/default/in/touchpadclick"
+                  },
+                  "touch" : {
+                     "output" : "/actions/default/in/touchpadtouch"
                   }
                },
                "mode" : "button",
