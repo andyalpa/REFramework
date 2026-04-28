@@ -183,6 +183,7 @@ public:
     auto get_action_a_button_touch() const { return m_action_a_button_touch; }
     auto get_action_b_button_touch() const { return m_action_b_button_touch; }
     auto get_action_thumbrest_touch() const { return m_action_thumbrest_touch; }
+    auto get_action_touchpad_touch() const { return m_action_touchpad_touch; }
     auto get_action_a_button() const { return m_action_a_button; }
     auto get_action_b_button() const { return m_action_b_button; }
     auto get_action_weapon_dial() const { return m_action_weapon_dial; }
@@ -373,6 +374,7 @@ private:
     vr::VRActionHandle_t m_action_a_button_touch{};
     vr::VRActionHandle_t m_action_b_button_touch{};
     vr::VRActionHandle_t m_action_thumbrest_touch{};
+    vr::VRActionHandle_t m_action_touchpad_touch{};
     vr::VRActionHandle_t m_action_a_button{};
     vr::VRActionHandle_t m_action_b_button{};
     vr::VRActionHandle_t m_action_dpad_up{};
@@ -406,6 +408,7 @@ private:
         { "/actions/default/in/AButtonTouch", m_action_a_button_touch },
         { "/actions/default/in/BButtonTouch", m_action_b_button_touch },
         { "/actions/default/in/ThumbrestTouch", m_action_thumbrest_touch },
+        { "/actions/default/in/TouchpadTouch", m_action_touchpad_touch },
         { "/actions/default/in/AButton", m_action_a_button },
         { "/actions/default/in/BButton", m_action_b_button },
         { "/actions/default/in/DPad_Up", m_action_dpad_up },
