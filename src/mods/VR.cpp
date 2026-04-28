@@ -733,6 +733,7 @@ void VR::on_lua_state_created(sol::state& lua) {
         "get_action_a_button_touch", &VR::get_action_a_button_touch,
         "get_action_b_button_touch", &VR::get_action_b_button_touch,
         "get_action_thumbrest_touch", &VR::get_action_thumbrest_touch,
+        "get_action_touchpad_touch", &VR::get_action_touchpad_touch,
         "get_action_a_button", &VR::get_action_a_button,
         "get_action_b_button", &VR::get_action_b_button,
         "get_action_weapon_dial", &VR::get_action_weapon_dial,
