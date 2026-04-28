@@ -213,8 +213,12 @@ public:
 
     static inline std::vector<InteractionBinding> s_bindings_map {
         {"/user/hand/*/input/grip/pose", "pose"},
+        // Buttons / digital actions
+        // Some interaction profiles expose trigger/grip as /click instead of the bare component path.
         {"/user/hand/*/input/trigger", "trigger"}, // oculus?
+        {"/user/hand/*/input/trigger/click", "trigger"}, // index/wmr/etc
         {"/user/hand/*/input/squeeze", "grip"}, // oculus/vive/index
+        {"/user/hand/*/input/squeeze/click", "grip"}, // wmr/etc
         {"/user/hand/*/input/x/click", "abutton"}, // oculus?
         {"/user/hand/*/input/y/click", "bbutton"}, // oculus?
         {"/user/hand/*/input/a/click", "abutton"}, // oculus?
@@ -233,6 +237,7 @@ public:
 
         {"/user/hand/*/input/trackpad", "touchpad"}, // vive & others
         {"/user/hand/*/input/trackpad/click", "touchpadclick"}, // vive & others
+        {"/user/hand/*/input/trackpad/touch", "touchpadtouch"}, // vive/wmr/index capacitive touch
         {"/user/hand/*/output/haptic", "haptic"}, // most of them
 
         {"/user/hand/right/input/a/click", "re3_dodge"},
